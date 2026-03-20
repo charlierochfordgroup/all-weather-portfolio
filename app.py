@@ -18,6 +18,7 @@ from cfd import analyze_cfd
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
+PRECOMPUTED_FILE = Path(__file__).resolve().parent / "precomputed_weights.pkl"
 
 st.set_page_config(page_title="All Weather Portfolio", layout="wide")
 st.title("All Weather Portfolio Analyser")
@@ -259,18 +260,54 @@ opt_cache_key = _cache_key(overlap_start_date if extended_backtest else start_da
 opt_cache_file = CACHE_DIR / f"all_opt_weights_{opt_cache_key}.pkl"
 
 
+def _constraints_are_default():
+    """Check if the user's current constraints match the shipped defaults."""
+    return (st.session_state.asset_min == _DEFAULT_MIN and
+            st.session_state.asset_max == _DEFAULT_MAX and
+            st.session_state.group_max == _DEFAULT_GROUP_MAX and
+            abs(risk_free_rate - 0.04) < 1e-9)
+
+
+def _stats_from_weights(base_w, dd_w, bt_data, rf, rb, a_starts):
+    """Compute stats for pre-loaded weights (fast — no optimisation)."""
+    base_results = {}
+    for tgt, w in base_w.items():
+        s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
+        base_results[tgt] = {"weights": w, "stats": s}
+    dd_results = {}
+    for dd_pct, targets in dd_w.items():
+        dd_results[dd_pct] = {}
+        for tgt, w in targets.items():
+            s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
+            dd_results[dd_pct][tgt] = {"weights": w, "stats": s}
+    return base_results, dd_results
+
+
 def _load_or_compute(opt_data, bt_data, rf, rb,
                      _cache_file, _opt_cache_file, a_starts):
     """Load cached portfolios or compute them.
 
     Returns (base_results, dd_results).
-    Disk-cached + session state gating avoids expensive DataFrame hashing.
+    Priority: 1) disk cache  2) pre-computed weights  3) cached opt weights  4) full optimisation.
     """
     # Check full cache (exact match including rebalance)
     if _cache_file.exists():
         try:
             with open(_cache_file, "rb") as f:
                 return pickle.load(f)
+        except Exception:
+            pass
+
+    # Try pre-computed weights (shipped with repo) if constraints are default
+    if _constraints_are_default() and PRECOMPUTED_FILE.exists():
+        try:
+            with open(PRECOMPUTED_FILE, "rb") as f:
+                pre = pickle.load(f)
+            base_results, dd_results = _stats_from_weights(
+                pre["base_weights"], pre["dd_weights"], bt_data, rf, rb, a_starts)
+            with open(_cache_file, "wb") as f:
+                pickle.dump((base_results, dd_results), f)
+            return base_results, dd_results
         except Exception:
             pass
 
@@ -284,18 +321,9 @@ def _load_or_compute(opt_data, bt_data, rf, rb,
             pass
 
     if opt_weights is not None:
-        # Recompute stats only (fast) — evaluate on full backtest range
         base_w, dd_w = opt_weights
-        base_results = {}
-        for tgt, w in base_w.items():
-            s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
-            base_results[tgt] = {"weights": w, "stats": s}
-        dd_results = {}
-        for dd_pct, targets in dd_w.items():
-            dd_results[dd_pct] = {}
-            for tgt, w in targets.items():
-                s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
-                dd_results[dd_pct][tgt] = {"weights": w, "stats": s}
+        base_results, dd_results = _stats_from_weights(
+            base_w, dd_w, bt_data, rf, rb, a_starts)
     else:
         base_results, dd_results = _compute_all(opt_data, bt_data, rf, rb, a_starts)
         # Cache weights separately
