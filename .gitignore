@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.cache/
+.claude/
+*.tmp
+settings.local.json
