@@ -15,6 +15,8 @@ from stats import (
 )
 from optimizer import run_optimization, _group_indices
 from cfd import analyze_cfd
+from regime import load_regime_data, classify_regimes, optimize_per_regime, build_regime_schedule, regime_analytics, REGIME_LABELS
+from dd_momentum import compute_dd_adjustments, build_dd_momentum_schedule, dd_analytics
 
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
@@ -48,9 +50,11 @@ except Exception as e:
 if not data_loaded:
     st.stop()
 
-# Filter to available assets
+# Filter to available assets (Bitcoin exclusion applied after sidebar is set up)
 available = [a for a in ASSETS if a in all_returns.columns]
 returns_full = all_returns[available]
+
+# Placeholder — Bitcoin exclusion applied after sidebar checkbox
 
 # Compute asset start dates (first non-zero return per asset)
 asset_starts = compute_asset_starts(returns_full)
@@ -65,13 +69,24 @@ data_start_earliest = min(asset_starts.values()).date()
 data_end = returns_full.index[-1].date()
 
 st.sidebar.header("Analysis Settings")
+
+# Inception mode: if user clicked inception, override the default start date
+_start_default = overlap_start_date
+if st.session_state.get("_use_inception", False):
+    _start_default = data_start_earliest
+
 col1, col2 = st.sidebar.columns(2)
-start_date = col1.date_input("Backtest Start", value=overlap_start_date,
+start_date = col1.date_input("Backtest Start", value=_start_default,
                              min_value=data_start_earliest, max_value=data_end,
                              format="DD/MM/YYYY")
 end_date = col2.date_input("End Date", value=data_end,
                            min_value=data_start_earliest, max_value=data_end,
                            format="DD/MM/YYYY")
+if st.sidebar.button("Inception (Earliest Data)"):
+    st.session_state["_use_inception"] = True
+    st.rerun()
+
+exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=False)
 
 # Determine if we're in extended backtest mode (start before all assets exist)
 extended_backtest = start_date < overlap_start_date
@@ -104,11 +119,21 @@ dd_constraint_pct = st.sidebar.selectbox(
 )
 dd_constraint_val = dd_constraint_pct / 100.0
 
+# DD Momentum bump strength
+st.sidebar.header("Dynamic Strategy Settings")
+dd_bump_max_pct = st.sidebar.slider(
+    "DD Momentum Max Bump (%)",
+    min_value=10, max_value=100, value=50, step=5,
+    help="Maximum allocation bump for the most deeply drawn-down asset.",
+    key="dd_bump_max",
+)
+dd_bump_max = dd_bump_max_pct / 100.0
+
 # Base strategies (always computed once)
 _BASE_TARGETS = [
     "Max Sharpe Ratio", "Min Volatility", "Max Calmar Ratio",
     "Minimize Max Drawdown",
-    "Risk Parity", "Equal Risk Contribution", "Hierarchical Risk Parity",
+    "Inverse Volatility", "Equal Risk Contribution", "Hierarchical Risk Parity",
 ]
 
 # DD-constrained targets (computed for each DD level)
@@ -160,6 +185,12 @@ min_w_active = np.array([st.session_state.asset_min.get(a, 1.0) / 100.0 for a in
 max_w_active = np.array([st.session_state.asset_max.get(a, 30.0) / 100.0 for a in ASSETS])
 group_max_active = {g: v / 100.0 for g, v in st.session_state.group_max.items()}
 
+# Exclude Bitcoin: force min=0, max=0 so optimizer gives it zero weight
+if exclude_bitcoin:
+    btc_idx = ASSETS.index("Bitcoin")
+    min_w_active[btc_idx] = 0.0
+    max_w_active[btc_idx] = 0.0
+
 # ──────────────────────────────────────────────
 # FIXED BENCHMARK PORTFOLIOS
 # ──────────────────────────────────────────────
@@ -192,7 +223,8 @@ def _cache_key(sd, ed, rf, rb):
     # Include constraint fingerprint so changes to min/max/group trigger recomputation
     constraints_str = (f"{sorted(st.session_state.asset_min.items())}_"
                        f"{sorted(st.session_state.asset_max.items())}_"
-                       f"{sorted(st.session_state.group_max.items())}")
+                       f"{sorted(st.session_state.group_max.items())}_"
+                       f"excl_btc={exclude_bitcoin}")
     raw = f"{sd}_{ed}_{rf}_{rb}_{constraints_str}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
@@ -210,10 +242,18 @@ def _compute_all(opt_data, bt_data, rf, rb, a_starts):
     """
     base_results = {}
     for tgt in _BASE_TARGETS:
-        w = run_optimization(
-            opt_data, tgt, min_w_default, max_w_default, default_group_max,
-            rf, rebalance="daily",
-        )
+        # Minimize Max Drawdown needs to evaluate DD on full backtest period
+        if tgt == "Minimize Max Drawdown" and a_starts is not None:
+            w = run_optimization(
+                opt_data, tgt, min_w_default, max_w_default, default_group_max,
+                rf, rebalance="daily",
+                dd_returns=bt_data, dd_asset_starts=a_starts,
+            )
+        else:
+            w = run_optimization(
+                opt_data, tgt, min_w_default, max_w_default, default_group_max,
+                rf, rebalance="daily",
+            )
         s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
         base_results[tgt] = {"weights": w, "stats": s}
 
@@ -265,7 +305,8 @@ def _constraints_are_default():
     return (st.session_state.asset_min == _DEFAULT_MIN and
             st.session_state.asset_max == _DEFAULT_MAX and
             st.session_state.group_max == _DEFAULT_GROUP_MAX and
-            abs(risk_free_rate - 0.04) < 1e-9)
+            abs(risk_free_rate - 0.04) < 1e-9 and
+            not exclude_bitcoin)
 
 
 def _stats_from_weights(base_w, dd_w, bt_data, rf, rb, a_starts):
@@ -367,6 +408,93 @@ st.session_state.portfolios["Dalio All Weather"] = {
     "weights": _DALIO_WEIGHTS,
     "stats": _dalio_stats,
 }
+
+# ──────────────────────────────────────────────
+# DYNAMIC STRATEGIES
+# ──────────────────────────────────────────────
+_MACRO_FILE = Path(__file__).resolve().parent / "Inflation and IR.xlsx"
+
+# --- DD Momentum Strategy ---
+# Always available (uses only return data)
+# Uses DD-constrained Max Sharpe as base if available, otherwise unconstrained
+if "base_results" in st.session_state and "Max Sharpe Ratio" in st.session_state.base_results:
+    _dd_base_key = f"Max Sharpe (DD \u2264 X%)"
+    if ("dd_results" in st.session_state and dd_constraint_pct in st.session_state.dd_results
+            and _dd_base_key in st.session_state.dd_results[dd_constraint_pct]):
+        _ms_weights = st.session_state.dd_results[dd_constraint_pct][_dd_base_key]["weights"]
+    else:
+        _ms_weights = st.session_state.base_results["Max Sharpe Ratio"]["weights"]
+
+    # Annual checkpoint dates within backtest range
+    _years = sorted(set(returns.index.year))
+    _checkpoints = []
+    for y in _years:
+        yr_dates = returns.index[returns.index.year == y]
+        if len(yr_dates) > 0:
+            _checkpoints.append(yr_dates[0])  # first trading day of each year
+
+    _dd_adj = compute_dd_adjustments(returns, _checkpoints, bump_max=dd_bump_max)
+    _dd_schedule = build_dd_momentum_schedule(_ms_weights, _dd_adj)
+
+    _rebal_for_dynamic = rebalance if rebalance != "daily" else "annual"
+    _dd_stats = calc_stats(
+        returns, _ms_weights, risk_free_rate,
+        rebalance=_rebal_for_dynamic, asset_starts=bt_asset_starts,
+        weights_schedule=_dd_schedule,
+    )
+    # Representative weights = latest in schedule
+    _dd_repr_w = _dd_schedule[max(_dd_schedule.keys())] if _dd_schedule else _ms_weights
+    st.session_state.portfolios["DD P-Value Momentum (time-varying)"] = {
+        "weights": _dd_repr_w,
+        "stats": _dd_stats,
+        "weights_schedule": _dd_schedule,
+        "strategy_type": "dd_momentum",
+    }
+    st.session_state._dd_schedule = _dd_schedule
+    st.session_state._dd_checkpoints = _checkpoints
+
+# --- Regime Strategy ---
+_macro_data = load_regime_data(_MACRO_FILE)
+st.session_state._macro_available = _macro_data is not None
+
+if _macro_data is not None and "base_results" in st.session_state:
+    _regime_series = classify_regimes(_macro_data)
+    st.session_state._regime_series = _regime_series
+
+    # Only optimise regimes if we haven't cached them for this config
+    _regime_cache_key = _cache_key(f"regime_{overlap_start_date}_{dd_constraint_pct}", end_date, risk_free_rate, "daily")
+    if st.session_state.get("_regime_cache_key") != _regime_cache_key:
+        with st.sidebar:
+            with st.spinner("Computing regime portfolios..."):
+                _regime_weights = optimize_per_regime(
+                    opt_returns, _regime_series, "Max Sharpe Ratio",
+                    min_w_default, max_w_default, default_group_max,
+                    risk_free_rate, rebalance="daily",
+                )
+                st.session_state._regime_weights = _regime_weights
+                st.session_state._regime_cache_key = _regime_cache_key
+    else:
+        _regime_weights = st.session_state._regime_weights
+
+    _rebal_for_regime = rebalance if rebalance != "daily" else "annual"
+    _regime_schedule = build_regime_schedule(
+        returns.index, _regime_series, _regime_weights, _rebal_for_regime,
+    )
+    st.session_state._regime_schedule = _regime_schedule
+
+    # Average weights across regimes as representative
+    _regime_repr_w = np.mean(list(_regime_weights.values()), axis=0)
+    _regime_stats = calc_stats(
+        returns, _regime_repr_w, risk_free_rate,
+        rebalance=_rebal_for_regime, asset_starts=bt_asset_starts,
+        weights_schedule=_regime_schedule,
+    )
+    st.session_state.portfolios["Regime-Based (time-varying)"] = {
+        "weights": _regime_repr_w,
+        "stats": _regime_stats,
+        "weights_schedule": _regime_schedule,
+        "strategy_type": "regime",
+    }
 
 portfolio_names = list(st.session_state.portfolios.keys())
 
@@ -516,7 +644,7 @@ def _make_pie_data(weights, threshold=0.03):
 # ──────────────────────────────────────────────
 # MAIN: TABS
 # ──────────────────────────────────────────────
-tab_compare, tab_cfd, tab_settings = st.tabs(["Compare", "CFD Analysis", "Settings"])
+tab_compare, tab_dynamic, tab_cfd, tab_settings = st.tabs(["Compare", "Dynamic Strategies", "CFD Analysis", "Settings"])
 
 # ======================================================================
 # TAB 1: COMPARE
@@ -527,6 +655,9 @@ with tab_compare:
     else:
         # Strategy Comparison (all portfolios)
         st.header("Strategy Comparison")
+        st.caption(f"Backtest period: {start_date.strftime('%d/%m/%Y')} to {end_date.strftime('%d/%m/%Y')} "
+                   f"({(end_date - start_date).days // 365} years). "
+                   f"CAGR annualised using calendar days; volatility using {252} trading days/year.")
         comp_rows = []
         for pname, pdata in st.session_state.portfolios.items():
             comp_rows.append({"Strategy": pname, **_stats_row_numeric(pdata["stats"])})
@@ -584,10 +715,12 @@ with tab_compare:
         _eq_cache = {}
         for pname in set(eq_selected) | set(st.session_state.get("dd_select", [])):
             if pname in st.session_state.portfolios:
-                pw = st.session_state.portfolios[pname]["weights"]
+                pdata = st.session_state.portfolios[pname]
+                pw = pdata["weights"]
+                ws = pdata.get("weights_schedule")
                 _eq_cache[pname] = compute_equity_curve(
                     returns, pw, start_ts, end_ts, rebalance=rebalance,
-                    asset_starts=bt_asset_starts,
+                    asset_starts=bt_asset_starts, weights_schedule=ws,
                 )
 
         fig_eq = go.Figure()
@@ -659,14 +792,17 @@ with tab_compare:
         fig_dd = go.Figure()
         for idx, pname in enumerate(dd_selected):
             if pname not in _eq_cache:
-                pw = st.session_state.portfolios[pname]["weights"]
+                pdata = st.session_state.portfolios[pname]
+                pw = pdata["weights"]
+                ws = pdata.get("weights_schedule")
                 _eq_cache[pname] = compute_equity_curve(
                     returns, pw, start_ts, end_ts, rebalance=rebalance,
-                    asset_starts=bt_asset_starts,
+                    asset_starts=bt_asset_starts, weights_schedule=ws,
                 )
             dd = compute_drawdown_series(_eq_cache[pname])
             color = _CHART_COLORS[idx % len(_CHART_COLORS)]
-            fig_dd.add_trace(go.Scatter(x=dd.index, y=dd.values, name=pname, fill="tozeroy", line=dict(color=color)))
+            fig_dd.add_trace(go.Scatter(x=dd.index, y=dd.values, name=pname, fill="tozeroy",
+                                       line=dict(color=color), fillcolor=f"rgba({int(color[1:3],16)},{int(color[3:5],16)},{int(color[5:7],16)},0.08)"))
         fig_dd.update_layout(
             title="Drawdown",
             yaxis_title="Drawdown",
@@ -710,8 +846,11 @@ with tab_compare:
 
         fig_ann = go.Figure()
         for idx, pname in enumerate(ann_selected):
-            pw = st.session_state.portfolios[pname]["weights"]
-            ann = compute_annual_returns(returns, pw, start_ts, end_ts, rebalance=rebalance, asset_starts=bt_asset_starts)
+            pdata = st.session_state.portfolios[pname]
+            pw = pdata["weights"]
+            ws = pdata.get("weights_schedule")
+            ann = compute_annual_returns(returns, pw, start_ts, end_ts, rebalance=rebalance,
+                                         asset_starts=bt_asset_starts, weights_schedule=ws)
             color = _CHART_COLORS[idx % len(_CHART_COLORS)]
             fig_ann.add_trace(go.Bar(x=ann.index.astype(str), y=ann.values, name=pname, marker_color=color))
         fig_ann.update_layout(
@@ -773,7 +912,200 @@ with tab_compare:
         _risk_analytics(st.session_state.portfolios[risk_selected]["weights"], risk_selected)
 
 # ======================================================================
-# TAB 2: CFD ANALYSIS
+# TAB 2: DYNAMIC STRATEGIES
+# ======================================================================
+with tab_dynamic:
+    st.header("Dynamic Strategies")
+    st.caption("Strategies that adjust allocations over time based on market conditions.")
+
+    # ── Section A: Regime-Based Allocation ──
+    st.subheader("Regime-Based Allocation")
+    if not st.session_state.get("_macro_available", False):
+        st.info("Regime data not available. Place 'Inflation and IR.xlsx' in the app directory with CPI and Fed Funds Rate data.")
+    elif "_regime_series" in st.session_state and "_regime_weights" in st.session_state:
+        _rs = st.session_state._regime_series
+        _rw = st.session_state._regime_weights
+        _analytics = regime_analytics(_rs, _rw, ASSETS)
+
+        # Current regime
+        st.metric("Current Regime", REGIME_LABELS.get(_analytics["current_regime"], "Unknown"))
+
+        # Regime timeline chart — stacked bar with one bar per segment
+        fig_regime = go.Figure()
+        _regime_colors = {1: "#FF1744", 2: "#FF6D00", 3: "#2962FF", 4: "#00C853"}
+        # Build a daily regime series for the timeline
+        _regime_daily = _rs.reindex(pd.date_range(_rs.index[0], _rs.index[-1], freq="MS")).ffill()
+        for label_id, label_name in REGIME_LABELS.items():
+            mask = _regime_daily == label_id
+            y_vals = mask.astype(int)
+            fig_regime.add_trace(go.Bar(
+                x=_regime_daily.index,
+                y=y_vals,
+                name=label_name,
+                marker_color=_regime_colors.get(label_id, "#999"),
+                width=30 * 86400000,  # ~30 days in ms
+            ))
+        fig_regime.update_layout(
+            title="Regime Timeline",
+            xaxis_title="Date",
+            yaxis=dict(visible=False, range=[0, 1.1]),
+            barmode="stack",
+            height=220,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5),
+            margin=dict(b=80, t=40),
+            bargap=0,
+        )
+        st.plotly_chart(fig_regime, width="stretch")
+
+        # Regime stats
+        stat_cols = st.columns(4)
+        for i, (label_id, label_name) in enumerate(REGIME_LABELS.items()):
+            with stat_cols[i]:
+                count = _analytics["regime_counts"].get(label_id, 0)
+                avg_m = _analytics["regime_avg_months"].get(label_id, 0)
+                st.metric(label_name, f"{count} periods", f"Avg {avg_m:.0f} months",
+                          delta_color="off")
+
+        # Weights per regime table (transposed: assets as rows, regimes as columns)
+        st.subheader("Optimal Weights per Regime")
+        regime_w_data = {"Asset": ASSETS}
+        for label_id in sorted(_rw.keys()):
+            col_name = REGIME_LABELS.get(label_id, f"Regime {label_id}")
+            regime_w_data[col_name] = [_rw[label_id][i] * 100 for i in range(len(ASSETS))]
+        regime_w_df = pd.DataFrame(regime_w_data)
+        regime_w_config = {"Asset": st.column_config.TextColumn("Asset")}
+        for label_name in REGIME_LABELS.values():
+            regime_w_config[label_name] = st.column_config.NumberColumn(label_name, format="%.2f%%")
+        st.dataframe(regime_w_df, column_config=regime_w_config, width="stretch", hide_index=True)
+
+        # Equity curve comparison: Regime vs Max Sharpe
+        if "Regime-Based (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
+            st.subheader("Regime Strategy vs Max Sharpe (Static)")
+            _r_sched = st.session_state.get("_regime_schedule")
+            _r_repr = st.session_state.portfolios["Regime-Based (time-varying)"]["weights"]
+            _ms_w = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
+            _rebal_dyn = rebalance if rebalance != "daily" else "annual"
+
+            eq_regime = compute_equity_curve(
+                returns, _r_repr, start_ts, end_ts, rebalance=_rebal_dyn,
+                asset_starts=bt_asset_starts, weights_schedule=_r_sched,
+            )
+            eq_sharpe = compute_equity_curve(
+                returns, _ms_w, start_ts, end_ts, rebalance=rebalance,
+                asset_starts=bt_asset_starts,
+            )
+
+            fig_rv = go.Figure()
+            fig_rv.add_trace(go.Scatter(x=eq_regime.index, y=eq_regime.values, name="Regime-Based (time-varying)", line=dict(color="#FF6D00")))
+            fig_rv.add_trace(go.Scatter(x=eq_sharpe.index, y=eq_sharpe.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+            fig_rv.update_layout(
+                yaxis_type="log", yaxis_title="Growth of $1 (Log)",
+                xaxis_title="Date", hovermode="x unified",
+                template="plotly_white", height=400,
+            )
+            st.plotly_chart(fig_rv, width="stretch")
+
+    st.markdown("---")
+
+    # ── Section B: DD P-Value Momentum ──
+    st.subheader("Drawdown P-Value Momentum")
+    st.caption("Boosts allocation to assets with historically rare drawdowns (buying opportunities) "
+               "and reduces allocation to assets near all-time highs.")
+
+    if "_dd_checkpoints" in st.session_state and "base_results" in st.session_state:
+        _dd_an = dd_analytics(returns, end_ts, bump_max=dd_bump_max)
+
+        # Current p-values and bump factors table
+        _dd_rows = []
+        sorted_idx = np.argsort(_dd_an["pvalues"])
+        for i in sorted_idx:
+            _dd_rows.append({
+                "Asset": _dd_an["assets"][i],
+                "Current DD": _dd_an["current_dd"][i] * 100,
+                "P-Value": _dd_an["pvalues"][i],
+                "Episodes": int(_dd_an["episode_counts"][i]),
+                "Bump Factor": _dd_an["bump_factors"][i] * 100,
+            })
+        _dd_df = pd.DataFrame(_dd_rows)
+        st.dataframe(
+            _dd_df,
+            column_config={
+                "Asset": st.column_config.TextColumn("Asset"),
+                "Current DD": st.column_config.NumberColumn("Current DD", format="%.2f%%"),
+                "P-Value": st.column_config.NumberColumn("P-Value", format="%.3f"),
+                "Episodes": st.column_config.NumberColumn("Episodes", format="%d"),
+                "Bump Factor": st.column_config.NumberColumn("Bump Factor", format="%+.0f%%"),
+            },
+            width="stretch",
+            hide_index=True,
+        )
+
+        # Allocation at a given date
+        if "_dd_schedule" in st.session_state and st.session_state._dd_schedule:
+            st.subheader("Allocation at Date")
+            _dd_sched_dates = sorted(st.session_state._dd_schedule.keys())
+            _dd_date_select = st.select_slider(
+                "Select rebalance date",
+                options=_dd_sched_dates,
+                value=_dd_sched_dates[-1],
+                format_func=lambda d: d.strftime("%d/%m/%Y"),
+                key="dd_alloc_date",
+            )
+            _dd_w_at_date = st.session_state._dd_schedule[_dd_date_select]
+            _ms_base = st.session_state.base_results["Max Sharpe Ratio"]["weights"]
+            _alloc_rows = []
+            for i, asset in enumerate(ASSETS):
+                _alloc_rows.append({
+                    "Asset": asset,
+                    "Base (Max Sharpe)": _ms_base[i] * 100,
+                    "DD Momentum": _dd_w_at_date[i] * 100,
+                    "Change": (_dd_w_at_date[i] - _ms_base[i]) * 100,
+                })
+            _alloc_df = pd.DataFrame(_alloc_rows)
+            st.dataframe(
+                _alloc_df,
+                column_config={
+                    "Asset": st.column_config.TextColumn("Asset"),
+                    "Base (Max Sharpe)": st.column_config.NumberColumn("Base (Max Sharpe)", format="%.2f%%"),
+                    "DD Momentum": st.column_config.NumberColumn("DD Momentum", format="%.2f%%"),
+                    "Change": st.column_config.NumberColumn("Change", format="%+.2f%%"),
+                },
+                width="stretch",
+                hide_index=True,
+            )
+
+        # Equity curve comparison: DD Momentum vs Max Sharpe
+        if "DD P-Value Momentum (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
+            st.subheader("DD Momentum vs Max Sharpe (Static)")
+            _dd_sched = st.session_state.get("_dd_schedule")
+            _dd_repr = st.session_state.portfolios["DD P-Value Momentum (time-varying)"]["weights"]
+            _ms_w2 = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
+            _rebal_dyn2 = rebalance if rebalance != "daily" else "annual"
+
+            eq_ddm = compute_equity_curve(
+                returns, _dd_repr, start_ts, end_ts, rebalance=_rebal_dyn2,
+                asset_starts=bt_asset_starts, weights_schedule=_dd_sched,
+            )
+            eq_sharpe2 = compute_equity_curve(
+                returns, _ms_w2, start_ts, end_ts, rebalance=rebalance,
+                asset_starts=bt_asset_starts,
+            )
+
+            fig_ddv = go.Figure()
+            fig_ddv.add_trace(go.Scatter(x=eq_ddm.index, y=eq_ddm.values, name="DD P-Value Momentum (time-varying)", line=dict(color="#00C853")))
+            fig_ddv.add_trace(go.Scatter(x=eq_sharpe2.index, y=eq_sharpe2.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+            fig_ddv.update_layout(
+                yaxis_type="log", yaxis_title="Growth of $1 (Log)",
+                xaxis_title="Date", hovermode="x unified",
+                template="plotly_white", height=400,
+            )
+            st.plotly_chart(fig_ddv, width="stretch")
+    else:
+        st.info("DD Momentum data not available — ensure base portfolios are computed.")
+
+# ======================================================================
+# TAB 3: CFD ANALYSIS
 # ======================================================================
 with tab_cfd:
     if not portfolio_names:
@@ -887,12 +1219,19 @@ with tab_cfd:
         st.header("10-Year Monte Carlo Projection")
         st.caption("Forward simulation using historical CAGR and volatility with geometric Brownian motion (500 paths).")
 
-        n_paths = 500
+        n_paths = 2000
         n_years = 10
         n_days_mc = 252 * n_years
         years_axis = np.linspace(0, n_years, n_days_mc + 1)
 
-        rng = np.random.RandomState(42)
+        # Allow user to resample MC paths
+        mc_seed = st.session_state.get("mc_seed", 42)
+        if st.button("Resample Monte Carlo", key="mc_resample"):
+            mc_seed = int(np.random.default_rng().integers(0, 2**31))
+            st.session_state.mc_seed = mc_seed
+            st.rerun()
+
+        rng = np.random.RandomState(mc_seed)
         z = rng.randn(n_paths, n_days_mc)
 
         def _mc_fan(start_val, cagr, vol):
@@ -1023,23 +1362,32 @@ with tab_cfd:
         # ── 10-Year Median Projection Table (all portfolios) ──
         st.markdown("---")
         st.header("10-Year Median Projection")
-        st.caption(f"Median portfolio value after 10 years per ${cfd_capital:,.0f} capital, based on Monte Carlo (GBM, 500 paths). "
+        st.caption(f"Median portfolio value after 10 years per ${cfd_capital:,.0f} capital, computed from Monte Carlo simulation ({n_paths} paths). "
                    f"Leveraged column uses {cfd_leverage:.0f}x leverage with {cfd_fin_pct:.1f}% financing.")
+
+        def _mc_median_10y(start_val, cagr, vol):
+            """Compute the actual MC median at year 10 (not the deterministic formula)."""
+            daily_mu = np.log(1.0 + cagr) / 252.0
+            daily_sigma = vol / np.sqrt(252.0)
+            daily_log_ret = daily_mu + daily_sigma * z  # reuse the shared z matrix
+            cum_log = np.sum(daily_log_ret, axis=1)  # sum over all days for final value
+            final_vals = start_val * np.exp(cum_log)
+            return round(np.median(final_vals))
 
         proj_rows = []
         for pname, pdata in st.session_state.portfolios.items():
             p_stats = pdata["stats"]
             p_weights = pdata["weights"]
 
-            # Unleveraged median after 10 years: (1 + CAGR)^years
-            ul_median_10y = round(cfd_capital * (1.0 + p_stats.cagr) ** n_years)
+            # Unleveraged median from MC simulation
+            ul_median_10y = _mc_median_10y(cfd_capital, p_stats.cagr, p_stats.volatility)
 
             # Leveraged: compute CFD metrics for this portfolio
             p_cfd = analyze_cfd(
                 p_weights, p_stats, cfd_capital, cfd_leverage,
                 cfd_financing, cfd_margin_pct, risk_free_rate,
             )
-            lev_median_10y = round(p_cfd.deployed_capital * (1.0 + p_cfd.net_cagr) ** n_years)
+            lev_median_10y = _mc_median_10y(p_cfd.deployed_capital, p_cfd.net_cagr, p_cfd.leveraged_volatility)
 
             proj_rows.append({
                 "Strategy": pname,

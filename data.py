@@ -1,5 +1,6 @@
 """Data loading, alignment, and log return computation."""
 
+import warnings
 import numpy as np
 import pandas as pd
 import shutil
@@ -88,6 +89,12 @@ def _sanitize_cash_returns(returns: pd.DataFrame, max_daily_abs: float = 0.005) 
     if "Cash" in returns.columns:
         raw_cash_std = returns["Cash"].std()
         if raw_cash_std > 0.01:  # unrealistically high daily vol
+            n_capped = ((returns["Cash"].abs() > max_daily_abs)).sum()
+            warnings.warn(
+                f"Cash returns sanitized: daily vol ({raw_cash_std:.4f}) exceeded threshold. "
+                f"{n_capped} values capped to +/-{max_daily_abs:.3f}.",
+                stacklevel=2,
+            )
             returns = returns.copy()
             returns["Cash"] = returns["Cash"].clip(lower=-max_daily_abs, upper=max_daily_abs)
     return returns

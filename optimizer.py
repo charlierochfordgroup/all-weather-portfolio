@@ -1,5 +1,6 @@
 """Portfolio optimization strategies."""
 
+import warnings
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -26,6 +27,20 @@ def clip_normalize(
     max_iter: int = 20,
 ) -> np.ndarray:
     """Project weights onto the feasible set (box + group + sum-to-1 constraints)."""
+    # Feasibility check: sum of max weights must be >= 1 and sum of min weights <= 1
+    if max_w.sum() < 1.0 - 1e-6:
+        warnings.warn(
+            f"Infeasible constraints: sum of max weights ({max_w.sum():.2f}) < 1.0. "
+            f"Cannot find a valid allocation. Results will be approximate.",
+            stacklevel=2,
+        )
+    if min_w.sum() > 1.0 + 1e-6:
+        warnings.warn(
+            f"Infeasible constraints: sum of min weights ({min_w.sum():.2f}) > 1.0. "
+            f"Cannot find a valid allocation. Results will be approximate.",
+            stacklevel=2,
+        )
+
     w = w.copy()
     n = len(w)
     groups = _group_indices()
@@ -107,6 +122,11 @@ def _objective(
     elif target in ("Max Calmar Ratio", "Max Calmar (DD \u2264 X%)"):
         return -s.calmar + dd_penalty
     elif target == "Minimize Max Drawdown":
+        # If extended backtest data is provided, evaluate DD on the full period
+        if dd_returns is not None:
+            s_dd = calc_stats(dd_returns, w, risk_free_rate, rebalance=rebalance,
+                              asset_starts=dd_asset_starts)
+            return abs(s_dd.max_drawdown) + s_dd.longest_dd * 5e-5
         return abs(s.max_drawdown) + s.longest_dd * 5e-5
     return -s.sharpe + dd_penalty
 
@@ -286,13 +306,13 @@ def _optimize_drawdown(
     return clip_normalize(best_w, min_w, max_w, group_max)
 
 
-def risk_parity(
+def inverse_volatility(
     returns: pd.DataFrame,
     min_w: np.ndarray,
     max_w: np.ndarray,
     group_max: dict[str, float],
 ) -> np.ndarray:
-    """Inverse-volatility (risk parity) weighting."""
+    """Inverse-volatility weighting (simplified risk parity)."""
     vols = returns.std().reindex(ASSETS).fillna(returns.std().mean()).values
     vols = np.maximum(vols, 1e-6)
     w = 1.0 / vols
@@ -318,6 +338,7 @@ def equal_risk_contribution(
     w = 1.0 / vols
     w /= w.sum()
 
+    converged = False
     for i in range(max_iter):
         sigma_w = cov @ w
         risk_contrib = w * sigma_w
@@ -326,6 +347,7 @@ def equal_risk_contribution(
 
         max_dev = np.max(np.abs(risk_contrib - target_rc))
         if max_dev < 1e-7:
+            converged = True
             break
 
         for j in range(n):
@@ -334,6 +356,13 @@ def equal_risk_contribution(
             w[j] = max(w[j], 1e-4)
 
         w /= w.sum()
+
+    if not converged:
+        warnings.warn(
+            f"ERC did not converge after {max_iter} iterations "
+            f"(max deviation: {max_dev:.2e}). Results may be approximate.",
+            stacklevel=2,
+        )
 
     return clip_normalize(w, min_w, max_w, group_max)
 
@@ -411,8 +440,8 @@ def run_optimization(
     dd_asset_starts: dict | None = None,
 ) -> np.ndarray:
     """Dispatch to the appropriate optimization strategy."""
-    if target == "Risk Parity":
-        return risk_parity(returns, min_w, max_w, group_max)
+    if target == "Inverse Volatility":
+        return inverse_volatility(returns, min_w, max_w, group_max)
     elif target == "Equal Risk Contribution":
         return equal_risk_contribution(returns, min_w, max_w, group_max)
     elif target == "Hierarchical Risk Parity":

@@ -81,11 +81,28 @@ def _make_period_labels(index: pd.DatetimeIndex, rebalance: str) -> np.ndarray:
     return index.to_period(freq).astype("int64")
 
 
+def _resolve_schedule_weights(
+    date: pd.Timestamp,
+    weights_schedule: dict[pd.Timestamp, np.ndarray],
+    fallback: np.ndarray,
+) -> np.ndarray:
+    """Look up the most recent weight vector from a schedule for a given date."""
+    best_date = None
+    for d in weights_schedule:
+        if d <= date:
+            if best_date is None or d > best_date:
+                best_date = d
+    if best_date is not None:
+        return weights_schedule[best_date].copy()
+    return fallback.copy()
+
+
 def _periodic_rebal_returns(
     returns: pd.DataFrame,
     weights: np.ndarray,
     rebalance: str = "monthly",
     eff_weights: np.ndarray | None = None,
+    weights_schedule: dict[pd.Timestamp, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Compute daily simple portfolio returns with periodic rebalancing.
 
@@ -94,6 +111,10 @@ def _periodic_rebal_returns(
 
     If eff_weights is provided (n_days x n_assets), use per-day target weights
     at rebalance boundaries (for pro-rata redistribution of missing assets).
+
+    If weights_schedule is provided (dict mapping dates to weight arrays),
+    the target weights change over time. At each rebalance boundary, the
+    most recent schedule entry is used instead of the static weights.
 
     rebalance: "monthly", "quarterly", "semi-annual", or "annual".
     """
@@ -107,12 +128,33 @@ def _periodic_rebal_returns(
 
     port_simple = np.empty(n_days)
     has_eff = eff_weights is not None
+    has_schedule = weights_schedule is not None
+
+    # Pre-sort schedule dates for faster lookup
+    if has_schedule:
+        sorted_sched_dates = sorted(weights_schedule.keys())
+        sorted_sched_weights = [weights_schedule[d] for d in sorted_sched_dates]
 
     for seg_start, seg_end in zip(
         boundaries, np.append(boundaries[1:], n_days)
     ):
+        # Determine target weights at this boundary
+        if has_schedule:
+            boundary_date = returns.index[seg_start]
+            # Binary search for most recent schedule entry
+            target_w = weights.copy()
+            for i in range(len(sorted_sched_dates) - 1, -1, -1):
+                if sorted_sched_dates[i] <= boundary_date:
+                    target_w = sorted_sched_weights[i].copy()
+                    break
+        else:
+            target_w = weights
+
         # Reset to target weights at period boundary
-        cur_w = eff_weights[seg_start].copy() if has_eff else weights.copy()
+        if has_eff and not has_schedule:
+            cur_w = eff_weights[seg_start].copy()
+        else:
+            cur_w = target_w.copy()
 
         for t in range(seg_start, seg_end):
             sr = simple_rets[t]
@@ -125,7 +167,10 @@ def _periodic_rebal_returns(
             if total > 1e-12:
                 cur_w = grown / total
             else:
-                cur_w = eff_weights[t].copy() if has_eff else weights.copy()
+                if has_eff and not has_schedule:
+                    cur_w = eff_weights[t].copy()
+                else:
+                    cur_w = target_w.copy()
 
     return port_simple
 
@@ -138,6 +183,7 @@ def calc_stats(
     end_date: pd.Timestamp | None = None,
     rebalance: str = "daily",
     asset_starts: dict[str, pd.Timestamp] | None = None,
+    weights_schedule: dict[pd.Timestamp, np.ndarray] | None = None,
 ) -> PortfolioStats:
     """Calculate portfolio statistics from log returns and weights.
 
@@ -145,6 +191,8 @@ def calc_stats(
                "monthly" for monthly rebalancing with weight drift.
     asset_starts: when provided, weights for not-yet-available assets are
                   redistributed pro-rata to available assets on each day.
+    weights_schedule: when provided, target weights change over time. Forces
+                      periodic rebalancing (falls back to "monthly" if "daily").
     """
     if start_date is not None:
         returns = returns[returns.index >= start_date]
@@ -158,36 +206,52 @@ def calc_stats(
     if n_days == 0:
         return PortfolioStats()
 
+    # weights_schedule forces periodic rebalancing
+    if weights_schedule is not None and rebalance == "daily":
+        rebalance = "monthly"
+
     # Compute effective weights (pro-rata redistribution for missing assets)
     eff_w = None
-    if asset_starts is not None:
+    if asset_starts is not None and weights_schedule is None:
         eff_w = _effective_weights(weights, returns.index, list(returns.columns), asset_starts)
 
     if rebalance != "daily":
-        port_simple = _periodic_rebal_returns(returns, weights, rebalance, eff_w)
+        port_simple = _periodic_rebal_returns(
+            returns, weights, rebalance, eff_w,
+            weights_schedule=weights_schedule,
+        )
         idx = np.cumprod(1.0 + port_simple)
+        # Volatility from simple returns for consistency with Sharpe numerator
         var_r = np.var(port_simple, ddof=1) if n_days > 1 else 0.0
+        # Arithmetic mean of simple returns for Sharpe numerator
+        arith_mean_daily = np.mean(port_simple) if n_days > 0 else 0.0
     else:
         port_log = _daily_port_log(returns.values, weights, eff_w)
         idx = np.exp(np.cumsum(port_log))
-        var_r = np.var(port_log, ddof=1) if n_days > 1 else 0.0
+        # Convert log returns to simple for consistent Sharpe calculation
+        port_simple_from_log = np.exp(port_log) - 1.0
+        var_r = np.var(port_simple_from_log, ddof=1) if n_days > 1 else 0.0
+        arith_mean_daily = np.mean(port_simple_from_log) if n_days > 0 else 0.0
 
     vol = np.sqrt(var_r * TD)
 
-    # CAGR using calendar days
+    # Arithmetic mean annualised (for Sharpe — same basis as vol)
+    arith_annual = arith_mean_daily * TD
+
+    # CAGR using calendar days (for display, Calmar, etc.)
     total_calendar_days = (returns.index[-1] - returns.index[0]).days
     if total_calendar_days > 0 and idx[-1] > 0:
         cagr = idx[-1] ** (365.0 / total_calendar_days) - 1.0
     else:
         cagr = 0.0
 
-    # Sharpe
-    sharpe = (cagr - risk_free_rate) / vol if vol > 1e-4 else 0.0
+    # Sharpe: arithmetic excess return / volatility (both from simple returns)
+    sharpe = (arith_annual - risk_free_rate) / vol if vol > 1e-4 else 0.0
 
     # Max drawdown and longest drawdown (skip all-zero days)
     nonzero_mask = np.any(returns.values != 0, axis=1)
 
-    if rebalance != "daily":
+    if rebalance != "daily" or weights_schedule is not None:
         port_nz_simple = port_simple[nonzero_mask]
         idx_nz = np.cumprod(1.0 + port_nz_simple)
     else:
@@ -257,6 +321,7 @@ def compute_equity_curve(
     end_date: pd.Timestamp | None = None,
     rebalance: str = "daily",
     asset_starts: dict[str, pd.Timestamp] | None = None,
+    weights_schedule: dict[pd.Timestamp, np.ndarray] | None = None,
 ) -> pd.Series:
     """Compute cumulative equity curve (non-zero days only for clean chart)."""
     if start_date is not None:
@@ -266,12 +331,18 @@ def compute_equity_curve(
     nonzero_mask = np.any(returns.values != 0, axis=1)
     r = returns[nonzero_mask]
 
+    if weights_schedule is not None and rebalance == "daily":
+        rebalance = "monthly"
+
     eff_w = None
-    if asset_starts is not None:
+    if asset_starts is not None and weights_schedule is None:
         eff_w = _effective_weights(weights, r.index, list(r.columns), asset_starts)
 
     if rebalance != "daily":
-        port_simple = _periodic_rebal_returns(r, weights, rebalance, eff_w)
+        port_simple = _periodic_rebal_returns(
+            r, weights, rebalance, eff_w,
+            weights_schedule=weights_schedule,
+        )
         cum = np.cumprod(1.0 + port_simple)
     else:
         port_log = _daily_port_log(r.values, weights, eff_w)
@@ -293,6 +364,7 @@ def compute_annual_returns(
     end_date: pd.Timestamp | None = None,
     rebalance: str = "daily",
     asset_starts: dict[str, pd.Timestamp] | None = None,
+    weights_schedule: dict[pd.Timestamp, np.ndarray] | None = None,
 ) -> pd.Series:
     """Compute annual returns."""
     if start_date is not None:
@@ -302,12 +374,18 @@ def compute_annual_returns(
     nonzero_mask = np.any(returns.values != 0, axis=1)
     r = returns[nonzero_mask]
 
+    if weights_schedule is not None and rebalance == "daily":
+        rebalance = "monthly"
+
     eff_w = None
-    if asset_starts is not None:
+    if asset_starts is not None and weights_schedule is None:
         eff_w = _effective_weights(weights, r.index, list(r.columns), asset_starts)
 
     if rebalance != "daily":
-        port_simple = _periodic_rebal_returns(r, weights, rebalance, eff_w)
+        port_simple = _periodic_rebal_returns(
+            r, weights, rebalance, eff_w,
+            weights_schedule=weights_schedule,
+        )
         sr = pd.Series(port_simple, index=r.index)
         annual = sr.groupby(sr.index.year).apply(lambda x: np.prod(1.0 + x) - 1.0)
     else:

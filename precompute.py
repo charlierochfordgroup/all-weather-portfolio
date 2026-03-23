@@ -19,6 +19,8 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from data import ASSETS, load_data
 from stats import calc_stats, compute_asset_starts
 from optimizer import run_optimization
+from regime import load_regime_data, classify_regimes, optimize_per_regime
+from dd_momentum import compute_dd_adjustments, build_dd_momentum_schedule
 
 # ── Default settings (must match app.py defaults exactly) ──
 RISK_FREE_RATE = 0.04
@@ -40,7 +42,7 @@ DEFAULT_GROUP_MAX = {
 BASE_TARGETS = [
     "Max Sharpe Ratio", "Min Volatility", "Max Calmar Ratio",
     "Minimize Max Drawdown",
-    "Risk Parity", "Equal Risk Contribution", "Hierarchical Risk Parity",
+    "Inverse Volatility", "Equal Risk Contribution", "Hierarchical Risk Parity",
 ]
 DD_TARGETS = ["Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)"]
 DD_LEVELS = [5, 10, 15, 20, 25, 30]
@@ -97,10 +99,46 @@ def main():
             dd_w[dd_pct][tgt] = w
             prev_w[tgt] = w
 
+    # ── Dynamic strategies ──
+
+    # DD Momentum: compute annual adjustments using Max Sharpe as base
+    print("\nComputing DD Momentum adjustments...")
+    ms_weights = base_w["Max Sharpe Ratio"]
+    years = sorted(set(returns_full.index.year))
+    checkpoints = []
+    for y in years:
+        yr_dates = returns_full.index[returns_full.index.year == y]
+        if len(yr_dates) > 0:
+            checkpoints.append(yr_dates[0])
+    dd_adj = compute_dd_adjustments(returns_full, checkpoints)
+    dd_momentum_schedule = build_dd_momentum_schedule(ms_weights, dd_adj)
+    print(f"  {len(dd_adj)} annual checkpoints computed")
+
+    # Regime: optimise per regime if macro data available
+    macro_path = Path(__file__).resolve().parent / "Inflation and IR.xlsx"
+    macro_data = load_regime_data(macro_path)
+    regime_weights = None
+    regime_series = None
+    if macro_data is not None:
+        print("\nComputing regime portfolios...")
+        regime_series = classify_regimes(macro_data)
+        regime_weights = optimize_per_regime(
+            opt_returns, regime_series, "Max Sharpe Ratio",
+            min_w, max_w, group_max, rf, rebalance="daily",
+        )
+        for label_id, w in regime_weights.items():
+            print(f"  Regime {label_id}: done")
+    else:
+        print("\nNo macro data found — skipping regime pre-computation")
+
     # Save weights only (stats are recomputed at runtime for any backtest period)
     output = {
         "base_weights": base_w,
         "dd_weights": dd_w,
+        "dd_momentum_adjustments": dd_adj,
+        "dd_momentum_base": ms_weights,
+        "regime_weights": regime_weights,
+        "regime_series": regime_series,
         "overlap_start": overlap_start,
         "data_end": returns_full.index[-1],
         "default_min": DEFAULT_MIN,
