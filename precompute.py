@@ -20,7 +20,10 @@ from data import ASSETS, load_data
 from stats import calc_stats, compute_asset_starts
 from optimizer import run_optimization
 from regime import load_regime_data, classify_regimes, optimize_per_regime
-from dd_momentum import compute_dd_adjustments, build_dd_momentum_schedule
+from dd_momentum import (
+    compute_dd_adjustments, compute_dd_adjustments_scheduled,
+    build_dd_momentum_schedule, load_optimal_bump_schedule,
+)
 
 # ── Default settings (must match app.py defaults exactly) ──
 RISK_FREE_RATE = 0.04
@@ -110,7 +113,14 @@ def main():
         yr_dates = returns_full.index[returns_full.index.year == y]
         if len(yr_dates) > 0:
             checkpoints.append(yr_dates[0])
-    dd_adj = compute_dd_adjustments(returns_full, checkpoints)
+    # Use optimised per-rank bump schedule if available, otherwise parametric
+    optimal_sched = load_optimal_bump_schedule()
+    if optimal_sched is not None:
+        print("  Using optimised per-rank bump schedule")
+        dd_adj = compute_dd_adjustments_scheduled(returns_full, checkpoints, optimal_sched)
+    else:
+        print("  Using default parametric bump schedule (bump_max=50%)")
+        dd_adj = compute_dd_adjustments(returns_full, checkpoints)
     dd_momentum_schedule = build_dd_momentum_schedule(ms_weights, dd_adj)
     print(f"  {len(dd_adj)} annual checkpoints computed")
 
