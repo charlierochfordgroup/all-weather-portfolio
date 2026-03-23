@@ -129,6 +129,9 @@ def optimize_per_regime(
     group_max: dict[str, float],
     risk_free_rate: float = 0.04,
     rebalance: str = "daily",
+    dd_constraint: float | None = None,
+    dd_returns: pd.DataFrame | None = None,
+    dd_asset_starts: dict | None = None,
 ) -> dict[int, np.ndarray]:
     """Optimise independently on each regime's date subset.
 
@@ -142,6 +145,11 @@ def optimize_per_regime(
     regime_daily = regime_series.reindex(returns.index, method="ffill")
     regime_daily = regime_daily.bfill()
 
+    # Use DD-constrained target name if dd_constraint is set
+    opt_target = target
+    if dd_constraint is not None and target == "Max Sharpe Ratio":
+        opt_target = "Max Sharpe (DD \u2264 X%)"
+
     for label in sorted(regime_series.unique()):
         mask = regime_daily == label
         regime_returns = returns[mask]
@@ -152,8 +160,10 @@ def optimize_per_regime(
             w = np.ones(n) / n
         else:
             w = run_optimization(
-                regime_returns, target, min_w, max_w, group_max,
+                regime_returns, opt_target, min_w, max_w, group_max,
                 risk_free_rate, rebalance=rebalance,
+                dd_constraint=dd_constraint,
+                dd_returns=dd_returns, dd_asset_starts=dd_asset_starts,
             )
 
         regime_weights[label] = w

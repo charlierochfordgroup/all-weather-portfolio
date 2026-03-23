@@ -250,8 +250,9 @@ def _optimize_drawdown(
 
     Phase 1: Minimise portfolio volatility as a fast, smooth proxy for drawdown
              (lower vol portfolios tend to have lower max drawdown).
-    Phase 2: Pick the best vol-minimised candidate and refine with SLSQP on the
-             true max-drawdown objective (limited iterations for speed).
+    Phase 2: Also run SLSQP directly on the DD objective from multiple starts.
+    Phase 3: Evaluate the true max-drawdown on ALL candidates and pick the best.
+    Phase 4: Refine with Nelder-Mead (gradient-free, more robust for non-smooth DD).
     """
     n = len(ASSETS)
     cov = returns[ASSETS].cov().values * TD  # annualised covariance
@@ -277,28 +278,93 @@ def _optimize_drawdown(
             continue
 
     if not vol_candidates:
-        return clip_normalize(np.full(n, 1.0 / n), min_w, max_w, group_max)
+        vol_candidates = [clip_normalize(np.full(n, 1.0 / n), min_w, max_w, group_max)]
 
-    # Phase 2: Refine the top 3 vol candidates on true max-drawdown objective
-    # Sort by vol and take the best few — keeps Phase 2 fast
+    # Also add random perturbations of top vol candidates for diversity
     vol_candidates.sort(key=vol_obj)
-    phase2_starts = vol_candidates[:3]
+    rng = np.random.default_rng(42)
+    for base_w in vol_candidates[:2]:
+        for _ in range(3):
+            perturbed = base_w + rng.normal(0, 0.01, n)
+            perturbed = clip_normalize(np.maximum(perturbed, 0), min_w, max_w, group_max)
+            vol_candidates.append(perturbed)
 
-    best_w = None
-    best_val = np.inf
-
-    for w0 in phase2_starts:
+    # Phase 2: Also try direct SLSQP on the DD objective from multiple starts.
+    # DD is non-smooth but SLSQP can still find local minima near good starts.
+    dd_starts = vol_candidates[:3] + vol_starts[:2]
+    for w0 in dd_starts:
+        w0 = clip_normalize(w0, min_w, max_w, group_max)
         try:
             result = minimize(
                 obj, w0, method="SLSQP", bounds=bounds,
                 constraints=constraints,
-                options={"maxiter": 200, "ftol": 1e-8},
+                options={"maxiter": 300, "ftol": 1e-9},
             )
-            if result.fun < best_val:
-                best_val = result.fun
-                best_w = result.x
+            w_cand = clip_normalize(result.x, min_w, max_w, group_max)
+            vol_candidates.append(w_cand)
         except Exception:
             continue
+
+    # Add defensive starts: max-bond and max-cash-bond blends
+    # These are the most likely to have very low drawdowns.
+    for bond_frac in [0.6, 0.8]:
+        w_bond = np.full(n, (1.0 - bond_frac) / n)
+        for i, a in enumerate(ASSETS):
+            if GROUP_MAP[a] == "Bonds":
+                w_bond[i] = bond_frac / 3.0  # split across 3 bond assets
+        w_bond = clip_normalize(w_bond, min_w, max_w, group_max)
+        vol_candidates.append(w_bond)
+
+    # Phase 3: Evaluate true max-DD on ALL candidates and pick the best
+    best_w = None
+    best_val = np.inf
+
+    for w_cand in vol_candidates:
+        try:
+            val = obj(w_cand)
+            if val < best_val:
+                best_val = val
+                best_w = w_cand
+        except Exception:
+            continue
+
+    # Phase 4: Refine the best candidate with Nelder-Mead (gradient-free)
+    # More iterations and a better penalty structure for convergence.
+    if best_w is not None:
+        def constrained_obj(w):
+            w_proj = clip_normalize(w, min_w, max_w, group_max)
+            # Penalise deviation from feasible set (encourages staying feasible)
+            deviation = np.sum((w - w_proj) ** 2)
+            return obj(w_proj) + 50.0 * deviation
+
+        try:
+            result = minimize(
+                constrained_obj, best_w, method="Nelder-Mead",
+                options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-9},
+            )
+            w_nm = clip_normalize(result.x, min_w, max_w, group_max)
+            val_nm = obj(w_nm)
+            if val_nm < best_val:
+                best_w = w_nm
+                best_val = val_nm
+        except Exception:
+            pass
+
+        # Try a second Nelder-Mead pass with a perturbed start
+        try:
+            w_perturbed = best_w + rng.normal(0, 0.005, n)
+            w_perturbed = clip_normalize(np.maximum(w_perturbed, 0), min_w, max_w, group_max)
+            result2 = minimize(
+                constrained_obj, w_perturbed, method="Nelder-Mead",
+                options={"maxiter": 1000, "xatol": 1e-6, "fatol": 1e-9},
+            )
+            w_nm2 = clip_normalize(result2.x, min_w, max_w, group_max)
+            val_nm2 = obj(w_nm2)
+            if val_nm2 < best_val:
+                best_w = w_nm2
+                best_val = val_nm2
+        except Exception:
+            pass
 
     if best_w is None:
         best_w = vol_candidates[0]

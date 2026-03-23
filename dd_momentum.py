@@ -3,10 +3,17 @@
 Annually assesses each asset's current drawdown relative to its historical
 drawdown distribution. Assets with unusually deep drawdowns (low p-value)
 get allocation bumps; assets near highs get reductions.
+
+Supports two modes:
+1. Parametric (legacy): bump_max controls a linear interpolation.
+2. Optimised schedule: per-rank bump factors loaded from optimal_bump_schedule.pkl,
+   found via grid search over shape parameters (see optimize_bump.py).
 """
 
 import numpy as np
 import pandas as pd
+import pickle
+from pathlib import Path
 
 
 def _cumulative_prices(log_returns: pd.Series) -> pd.Series:
@@ -159,6 +166,65 @@ def compute_dd_adjustments(
                     adj[i] = -0.05 - (reduction_max - 0.05) * (pos_in_tail / max(remaining - 1, 1))
                 else:
                     adj[i] = -0.05
+
+        adjustments[cp_date] = adj
+
+    return adjustments
+
+
+def load_optimal_bump_schedule() -> np.ndarray | None:
+    """Load the pre-computed optimal per-rank bump schedule.
+
+    Returns array of length n_assets where schedule[rank] gives the
+    adjustment factor for that rank, or None if not found.
+    """
+    path = Path(__file__).resolve().parent / "optimal_bump_schedule.pkl"
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        return data["optimal_schedule"]
+    except Exception:
+        return None
+
+
+def compute_dd_adjustments_scheduled(
+    returns: pd.DataFrame,
+    checkpoint_dates: list[pd.Timestamp],
+    bump_schedule: np.ndarray,
+    relative_threshold: float = 0.25,
+) -> dict[pd.Timestamp, np.ndarray]:
+    """Compute per-asset adjustments using a custom per-rank bump schedule.
+
+    bump_schedule: array where bump_schedule[rank] gives the adjustment
+    for that p-value rank (rank 0 = lowest p-value = deepest DD).
+    """
+    n_assets = returns.shape[1]
+    adjustments = {}
+
+    for cp_date in checkpoint_dates:
+        r_up_to = returns[returns.index <= cp_date]
+        if len(r_up_to) < 20:
+            adjustments[cp_date] = np.zeros(n_assets)
+            continue
+
+        pvalues = np.ones(n_assets)
+        for i, col in enumerate(returns.columns):
+            asset_rets = r_up_to[col]
+            nz = asset_rets[asset_rets != 0]
+            if len(nz) < 20:
+                continue
+            prices = _cumulative_prices(nz)
+            episodes = detect_drawdown_episodes(prices, relative_threshold)
+            peak_val = prices.cummax().iloc[-1]
+            current_dd = prices.iloc[-1] / peak_val - 1.0
+            pvalues[i] = compute_pvalue(current_dd, episodes)
+
+        ranks = np.argsort(np.argsort(pvalues))
+        adj = np.zeros(n_assets)
+        for i in range(n_assets):
+            adj[i] = bump_schedule[min(ranks[i], len(bump_schedule) - 1)]
 
         adjustments[cp_date] = adj
 
