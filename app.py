@@ -85,8 +85,7 @@ start_date = col1.date_input("Backtest Start", value=_start_default,
 end_date = col2.date_input("End Date", value=data_end,
                            min_value=data_start_earliest, max_value=data_end,
                            format="DD/MM/YYYY")
-if st.sidebar.button(f"Use inception date ({data_start_earliest.strftime('%d/%m/%Y')})",
-                     type="tertiary", use_container_width=False):
+if st.sidebar.button("Inception", type="tertiary", use_container_width=False):
     st.session_state["_use_inception"] = True
     st.rerun()
 
@@ -99,7 +98,8 @@ if extended_backtest:
         f"Optimiser uses overlap period from {overlap_start_date}."
     )
 
-risk_free_pct = st.sidebar.number_input("Risk-Free Rate (%)", value=4.0, min_value=0.0, max_value=20.0, step=0.5, format="%.1f")
+risk_free_pct = st.sidebar.number_input("Risk-Free Rate (%)", value=4.0, min_value=0.0, max_value=20.0, step=0.5, format="%.1f",
+                                        help="Used for Sharpe ratio calculation and CFD cash reserve growth rate.")
 risk_free_rate = risk_free_pct / 100.0
 
 _REBAL_OPTIONS = {
@@ -121,16 +121,6 @@ dd_constraint_pct = st.sidebar.selectbox(
 )
 dd_constraint_val = dd_constraint_pct / 100.0
 exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=False)
-
-# DD Momentum bump strength
-st.sidebar.header("Dynamic Strategy Settings")
-dd_bump_max_pct = st.sidebar.slider(
-    "DD Momentum Max Bump (%)",
-    min_value=10, max_value=100, value=50, step=5,
-    help="Maximum allocation bump for the most deeply drawn-down asset.",
-    key="dd_bump_max",
-)
-dd_bump_max = dd_bump_max_pct / 100.0
 
 # Base strategies (always computed once)
 _BASE_TARGETS = [
@@ -501,12 +491,12 @@ if "base_results" in st.session_state and "Max Sharpe Ratio" in st.session_state
         if len(yr_dates) > 0:
             _checkpoints.append(yr_dates[0])  # first trading day of each year
 
-    # Use optimised per-rank bump schedule if available, otherwise parametric
+    # Use optimised per-rank bump schedule if available, otherwise default parametric
     _optimal_bump_sched = load_optimal_bump_schedule()
     if _optimal_bump_sched is not None:
         _dd_adj = compute_dd_adjustments_scheduled(returns, _checkpoints, _optimal_bump_sched)
     else:
-        _dd_adj = compute_dd_adjustments(returns, _checkpoints, bump_max=dd_bump_max)
+        _dd_adj = compute_dd_adjustments(returns, _checkpoints)
     _dd_schedule = build_dd_momentum_schedule(_ms_weights, _dd_adj)
 
     _rebal_for_dynamic = rebalance if rebalance != "daily" else "annual"
@@ -535,19 +525,54 @@ if _macro_data is not None and "base_results" in st.session_state:
     st.session_state._regime_series = _regime_series
 
     # Only optimise regimes if we haven't cached them for this config
-    _regime_cache_key = _cache_key(f"regime_{overlap_start_date}_{dd_constraint_pct}_btc={exclude_bitcoin}", end_date, risk_free_rate, "daily")
+    # Use a cache key WITHOUT btc flag so we can fast-path BTC exclusion
+    _regime_base_key = _cache_key(f"regime_{overlap_start_date}_{dd_constraint_pct}", end_date, risk_free_rate, "daily")
+    _regime_cache_key = f"{_regime_base_key}_btc={exclude_bitcoin}"
+
     if st.session_state.get("_regime_cache_key") != _regime_cache_key:
-        with st.sidebar:
-            with st.spinner("Computing regime portfolios..."):
-                _regime_weights = optimize_per_regime(
-                    opt_returns, _regime_series, "Max Sharpe Ratio",
-                    min_w_default, max_w_default, default_group_max,
-                    risk_free_rate, rebalance="daily",
-                    dd_constraint=dd_constraint_val,
-                    dd_returns=returns, dd_asset_starts=bt_asset_starts,
-                )
-                st.session_state._regime_weights = _regime_weights
-                st.session_state._regime_cache_key = _regime_cache_key
+        # Fast path: if only BTC toggled and we have cached regime weights,
+        # just zero out BTC and redistribute rather than full reoptimization
+        _prev_regime_key = st.session_state.get("_regime_cache_key", "")
+        _have_regime_cached = "_regime_weights" in st.session_state
+        _regime_btc_fast = (_have_regime_cached
+                            and _regime_base_key in _prev_regime_key
+                            and f"btc={not exclude_bitcoin}" in _prev_regime_key)
+
+        if _regime_btc_fast:
+            _cached_rw = st.session_state._regime_weights
+            if exclude_bitcoin:
+                btc_idx = ASSETS.index("Bitcoin")
+                _regime_weights = {}
+                for label, w in _cached_rw.items():
+                    w_new = w.copy()
+                    w_new[btc_idx] = 0.0
+                    remaining = w_new.sum()
+                    if remaining > 1e-12:
+                        w_new /= remaining
+                    _regime_weights[label] = w_new
+            else:
+                # Toggling OFF: need to reoptimize from scratch
+                with st.sidebar:
+                    with st.spinner("Computing regime portfolios..."):
+                        _regime_weights = optimize_per_regime(
+                            opt_returns, _regime_series, "Max Sharpe Ratio",
+                            min_w_default, max_w_default, default_group_max,
+                            risk_free_rate, rebalance="daily",
+                            dd_constraint=dd_constraint_val,
+                            dd_returns=returns, dd_asset_starts=bt_asset_starts,
+                        )
+        else:
+            with st.sidebar:
+                with st.spinner("Computing regime portfolios..."):
+                    _regime_weights = optimize_per_regime(
+                        opt_returns, _regime_series, "Max Sharpe Ratio",
+                        min_w_default, max_w_default, default_group_max,
+                        risk_free_rate, rebalance="daily",
+                        dd_constraint=dd_constraint_val,
+                        dd_returns=returns, dd_asset_starts=bt_asset_starts,
+                    )
+        st.session_state._regime_weights = _regime_weights
+        st.session_state._regime_cache_key = _regime_cache_key
     else:
         _regime_weights = st.session_state._regime_weights
 
@@ -719,7 +744,7 @@ def _make_pie_data(weights, threshold=0.03):
 # ──────────────────────────────────────────────
 # MAIN: TABS
 # ──────────────────────────────────────────────
-tab_compare, tab_dynamic, tab_cfd, tab_guide, tab_settings = st.tabs(["Compare", "Dynamic Strategies", "CFD Analysis", "Strategy Guide", "Settings"])
+tab_compare, tab_dynamic, tab_cfd, tab_guide, tab_settings = st.tabs(["Compare", "Dynamic Strategies", "CFD Analysis", "Guide", "Settings"])
 
 # ======================================================================
 # TAB 1: COMPARE
@@ -744,18 +769,18 @@ with tab_compare:
             hide_index=True,
         )
 
-        with st.expander("Allocation Comparison (weights by strategy)"):
-            alloc_rows = []
-            for pname, pdata in st.session_state.portfolios.items():
-                row = {"Strategy": pname}
-                for i, asset in enumerate(ASSETS):
-                    row[asset] = pdata["weights"][i] * 100
-                alloc_rows.append(row)
-            alloc_df = pd.DataFrame(alloc_rows)
-            alloc_config = {"Strategy": st.column_config.TextColumn("Strategy")}
-            for asset in ASSETS:
-                alloc_config[asset] = st.column_config.NumberColumn(asset, format="%.2f%%")
-            st.dataframe(alloc_df, column_config=alloc_config, width="stretch", hide_index=True)
+        st.subheader("Allocation Weights by Strategy")
+        alloc_rows = []
+        for pname, pdata in st.session_state.portfolios.items():
+            row = {"Strategy": pname}
+            for i, asset in enumerate(ASSETS):
+                row[asset] = pdata["weights"][i] * 100
+            alloc_rows.append(row)
+        alloc_df = pd.DataFrame(alloc_rows)
+        alloc_config = {"Strategy": st.column_config.TextColumn("Strategy")}
+        for asset in ASSETS:
+            alloc_config[asset] = st.column_config.NumberColumn(asset, format="%.2f%%")
+        st.dataframe(alloc_df, column_config=alloc_config, width="stretch", hide_index=True)
 
         # ── Charts ──
         st.header("Charts")
@@ -798,8 +823,11 @@ with tab_compare:
                     asset_starts=bt_asset_starts, weights_schedule=ws,
                 )
 
+        # Sort selected portfolios by final equity value (highest first) for legend ordering
+        _eq_sorted = sorted(eq_selected, key=lambda p: _eq_cache[p].iloc[-1], reverse=True)
+
         fig_eq = go.Figure()
-        for idx, pname in enumerate(eq_selected):
+        for idx, pname in enumerate(_eq_sorted):
             eq = _eq_cache[pname]
             color = _CHART_COLORS[idx % len(_CHART_COLORS)]
             fig_eq.add_trace(go.Scatter(x=eq.index, y=eq.values, name=pname, line=dict(color=color)))
@@ -912,10 +940,16 @@ with tab_compare:
                     updated.append(p)
             st.session_state.ann_select = updated
 
+        # Default to top 2 portfolios by CAGR
+        _sorted_by_cagr = sorted(portfolio_names,
+                                  key=lambda p: st.session_state.portfolios[p]["stats"].cagr,
+                                  reverse=True)
+        _ann_default = _sorted_by_cagr[:2]
+
         ann_selected = st.multiselect(
             "Select portfolios",
             portfolio_names,
-            default=portfolio_names[:3],
+            default=_ann_default,
             key="ann_select",
         )
 
@@ -992,10 +1026,10 @@ with tab_compare:
 with tab_dynamic:
     st.header("Dynamic Strategies")
     st.caption(f"Strategies that adjust allocations over time based on market conditions. "
-               f"Both strategies use the {dd_constraint_pct}% max drawdown constraint.")
+               f"Max drawdown constraint ({dd_constraint_pct}%) applied to both strategies via sidebar.")
 
     # ── Section A: Regime-Based Allocation ──
-    st.subheader("Regime-Based Allocation")
+    st.header("Regime-Based Allocation")
     if not st.session_state.get("_macro_available", False):
         st.info("Regime data not available. Place 'Inflation and IR.xlsx' in the app directory with CPI and Fed Funds Rate data.")
     elif "_regime_series" in st.session_state and "_regime_weights" in st.session_state:
@@ -1003,11 +1037,12 @@ with tab_dynamic:
         _rw = st.session_state._regime_weights
         _analytics = regime_analytics(_rs, _rw, ASSETS)
 
-        # Current regime
-        st.metric("Current Regime", REGIME_LABELS.get(_analytics["current_regime"], "Unknown"))
+        # Current regime — large heading with regime name smaller
+        st.subheader("Current Regime")
+        st.markdown(f"**{REGIME_LABELS.get(_analytics['current_regime'], 'Unknown')}**")
 
-        # Regime timeline — colour band per regime
-        st.caption("Regime Timeline")
+        # Regime timeline
+        st.subheader("Regime Timeline")
         fig_regime = go.Figure()
         _regime_colors = {1: "#FF1744", 2: "#FF6D00", 3: "#2962FF", 4: "#00C853"}
         _regime_daily = _rs.reindex(pd.date_range(_rs.index[0], _rs.index[-1], freq="MS")).ffill()
@@ -1048,19 +1083,20 @@ with tab_dynamic:
         fig_regime.update_layout(
             xaxis_title="Date",
             yaxis=dict(visible=False, range=[0, 1]),
-            height=180,
+            height=200,
             template="plotly_white",
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
-                y=1.02,
+                y=1.05,
                 xanchor="center",
                 x=0.5,
-                font=dict(size=11),
+                font=dict(size=10),
                 itemsizing="constant",
                 traceorder="normal",
+                itemwidth=30,
             ),
-            margin=dict(b=40, t=30, l=40, r=40),
+            margin=dict(b=40, t=50, l=40, r=40),
         )
         st.plotly_chart(fig_regime, width="stretch")
 
@@ -1070,8 +1106,9 @@ with tab_dynamic:
             with stat_cols[i]:
                 count = _analytics["regime_counts"].get(label_id, 0)
                 avg_m = _analytics["regime_avg_months"].get(label_id, 0)
-                st.metric(label_name, f"{count} periods", delta=None)
-                st.caption(f"Avg duration: {avg_m:.0f} months")
+                st.markdown(f"**{label_name}**")
+                st.markdown(f"{count} periods")
+                st.caption(f"Avg {avg_m:.0f} months")
 
         # Weights per regime table (transposed: assets as rows, regimes as columns)
         st.caption("Optimal Weights per Regime")
@@ -1087,7 +1124,7 @@ with tab_dynamic:
 
         # Equity curve comparison: Regime vs Max Sharpe
         if "Regime-Based (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
-            st.caption("Regime Strategy vs Max Sharpe (Static)")
+            st.subheader("Regime Strategy vs Max Sharpe (Static)")
             _r_sched = st.session_state.get("_regime_schedule")
             _r_repr = st.session_state.portfolios["Regime-Based (time-varying)"]["weights"]
             _ms_w = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
@@ -1105,22 +1142,39 @@ with tab_dynamic:
             fig_rv = go.Figure()
             fig_rv.add_trace(go.Scatter(x=eq_regime.index, y=eq_regime.values, name="Regime-Based (time-varying)", line=dict(color="#FF6D00")))
             fig_rv.add_trace(go.Scatter(x=eq_sharpe.index, y=eq_sharpe.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+            _rv_all = np.concatenate([eq_regime.values, eq_sharpe.values])
+            _rv_ymin = max(_rv_all.min() * 0.8, 0.5)
+            _rv_ymax = _rv_all.max() * 1.2
+            _rv_ticks = []
+            for exp in range(-1, 5):
+                base = 10 ** exp
+                for mult in [1, 2, 5]:
+                    val = base * mult
+                    if _rv_ymin <= val <= _rv_ymax:
+                        _rv_ticks.append(val)
             fig_rv.update_layout(
                 yaxis_type="log", yaxis_title="Growth of $1 (Log)",
                 xaxis_title="Date", hovermode="x unified",
                 template="plotly_white", height=400,
+                yaxis=dict(
+                    tickmode="array",
+                    tickvals=_rv_ticks,
+                    ticktext=[_fmt_growth(v) for v in _rv_ticks],
+                    range=[np.log10(_rv_ymin), np.log10(_rv_ymax)],
+                    gridcolor="rgba(128,128,128,0.15)",
+                ),
             )
             st.plotly_chart(fig_rv, width="stretch")
 
     st.markdown("---")
 
     # ── Section B: DD P-Value Momentum ──
-    st.subheader("Drawdown P-Value Momentum")
+    st.header("Drawdown P-Value Momentum")
     st.caption("Boosts allocation to assets with historically rare drawdowns (buying opportunities) "
                "and reduces allocation to assets near all-time highs.")
 
     if "_dd_checkpoints" in st.session_state and "base_results" in st.session_state:
-        _dd_an = dd_analytics(returns, end_ts, bump_max=dd_bump_max)
+        _dd_an = dd_analytics(returns, end_ts)
 
         # Current p-values and bump factors table
         _dd_rows = []
@@ -1183,7 +1237,7 @@ with tab_dynamic:
 
         # Equity curve comparison: DD Momentum vs Max Sharpe
         if "DD P-Value Momentum (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
-            st.caption("DD Momentum vs Max Sharpe (Static)")
+            st.subheader("DD Momentum vs Max Sharpe (Static)")
             _dd_sched = st.session_state.get("_dd_schedule")
             _dd_repr = st.session_state.portfolios["DD P-Value Momentum (time-varying)"]["weights"]
             _ms_w2 = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
@@ -1201,10 +1255,27 @@ with tab_dynamic:
             fig_ddv = go.Figure()
             fig_ddv.add_trace(go.Scatter(x=eq_ddm.index, y=eq_ddm.values, name="DD P-Value Momentum (time-varying)", line=dict(color="#00C853")))
             fig_ddv.add_trace(go.Scatter(x=eq_sharpe2.index, y=eq_sharpe2.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+            _ddv_all = np.concatenate([eq_ddm.values, eq_sharpe2.values])
+            _ddv_ymin = max(_ddv_all.min() * 0.8, 0.5)
+            _ddv_ymax = _ddv_all.max() * 1.2
+            _ddv_ticks = []
+            for exp in range(-1, 5):
+                base = 10 ** exp
+                for mult in [1, 2, 5]:
+                    val = base * mult
+                    if _ddv_ymin <= val <= _ddv_ymax:
+                        _ddv_ticks.append(val)
             fig_ddv.update_layout(
                 yaxis_type="log", yaxis_title="Growth of $1 (Log)",
                 xaxis_title="Date", hovermode="x unified",
                 template="plotly_white", height=400,
+                yaxis=dict(
+                    tickmode="array",
+                    tickvals=_ddv_ticks,
+                    ticktext=[_fmt_growth(v) for v in _ddv_ticks],
+                    range=[np.log10(_ddv_ymin), np.log10(_ddv_ymax)],
+                    gridcolor="rgba(128,128,128,0.15)",
+                ),
             )
             st.plotly_chart(fig_ddv, width="stretch")
     else:
@@ -1271,7 +1342,7 @@ with tab_cfd:
             ("Leveraged CAGR (Gross)", f"{cfd_result.gross_cagr:.2%}",
              "Leveraged CAGR accounting for vol drag, before financing"),
             ("Financing Drag", f"-{cfd_result.financing_drag:.2%}",
-             "Annual cost of borrowed notional"),
+             "Annual holding cost on full notional (rate × leverage)"),
             ("Net CAGR (on Deployed)", f"{cfd_result.net_cagr:.2%}",
              "CAGR after financing, on deployed capital"),
             ("Effective CAGR (on Total Capital)", f"{cfd_result.effective_cagr:.2%}",
@@ -1485,7 +1556,8 @@ with tab_cfd:
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
         )
         st.plotly_chart(fig_mc, width="stretch")
-        st.caption("Shaded bands: P5\u2013P95 (light) and P25\u2013P75 (dark). Solid line: median (P50).")
+        st.caption("Shaded bands: P5–P95 (light) and P25–P75 (dark). Solid line: median (P50). "
+                   "Leveraged returns account for volatility drag (L(L-1)σ²/2) and financing costs on borrowed notional.")
 
         # ── 10-Year Median Projection Table (all portfolios) ──
         st.markdown("---")
@@ -1549,68 +1621,100 @@ with tab_cfd:
 # STRATEGY GUIDE TAB
 # ──────────────────────────────────────────────
 with tab_guide:
-    st.header("Strategy Guide")
-    st.caption("How each portfolio strategy works and when it might be useful.")
+    st.header("Guide")
 
-    st.subheader("Static Strategies")
-    st.markdown("""
-**Max Sharpe Ratio** maximises the risk-adjusted return (return above the risk-free rate divided by volatility).
-Best for investors who want the highest return per unit of risk taken.
+    with st.container():
+        st.subheader("Static Strategies")
+        _guide_cols = st.columns(2)
+        with _guide_cols[0]:
+            st.markdown("""
+**Max Sharpe Ratio** — Maximises return per unit of risk (return above risk-free rate / volatility).
 
-**Min Volatility** finds the portfolio with the lowest possible standard deviation of returns.
-Best for investors who want the smoothest ride, accepting potentially lower returns.
+**Min Volatility** — Lowest possible portfolio standard deviation. Smoothest ride, potentially lower returns.
 
-**Max Calmar Ratio** maximises the ratio of annualised return to maximum drawdown.
-Best for investors focused on limiting peak-to-trough losses while maintaining strong returns.
+**Max Calmar Ratio** — Maximises return relative to worst drawdown. Balances growth with downside protection.
 
-**Minimize Max Drawdown** directly targets the portfolio with the smallest worst-case peak-to-trough loss.
-Best for investors whose primary concern is capital preservation during crises.
+**Minimize Max Drawdown** — Directly targets the smallest worst-case peak-to-trough loss.
+""")
+        with _guide_cols[1]:
+            st.markdown("""
+**Inverse Volatility** — Weights assets inversely to their volatility. Simple, transparent rule.
 
-**Inverse Volatility** weights each asset in inverse proportion to its historical volatility.
-A simple, transparent rule that gives more to stable assets and less to volatile ones.
+**Equal Risk Contribution** — Each asset contributes equal risk. Accounts for correlations unlike inverse vol.
 
-**Equal Risk Contribution (ERC)** ensures every asset contributes the same amount of risk to the portfolio.
-A more sophisticated version of inverse volatility that accounts for correlations between assets.
-
-**Hierarchical Risk Parity (HRP)** uses hierarchical clustering to group similar assets, then allocates
-using a top-down bisection approach. More robust to estimation error in the correlation matrix.
+**Hierarchical Risk Parity** — Clusters similar assets, allocates top-down. More robust to estimation error.
 """)
 
-    st.subheader("Drawdown-Constrained Strategies")
-    st.markdown(f"""
-**Max Sharpe (DD ≤ X%)** and **Max Calmar (DD ≤ X%)** apply the same optimisation as their unconstrained
-counterparts but add a penalty when the portfolio's maximum historical drawdown exceeds the selected
-threshold (currently {dd_constraint_pct}%). This trades off some return for better downside protection.
+    st.divider()
+
+    with st.container():
+        st.subheader("Drawdown-Constrained Strategies")
+        st.markdown(f"""
+**Max Sharpe (DD ≤ X%)** and **Max Calmar (DD ≤ X%)** add a drawdown penalty to their unconstrained
+counterparts. Currently set to **{dd_constraint_pct}%** — trades some return for downside protection.
 """)
 
-    st.subheader("Dynamic Strategies")
-    st.markdown("""
-**Regime-Based Allocation** classifies each month into one of four macroeconomic regimes based on
-whether inflation and interest rates are above or below their expanding-window historical medians.
-A separate Max Sharpe portfolio is optimised for each regime, and the portfolio switches allocations
-at each rebalance date based on the current regime.
+    st.divider()
 
-**DD P-Value Momentum** assesses each asset's current drawdown relative to its own historical drawdown
-distribution. Assets with unusually deep drawdowns (low p-value) are considered buying opportunities
-and receive allocation bumps, while assets near all-time highs get reductions. Adjustments are applied
-annually using the Max Sharpe portfolio as a base.
+    with st.container():
+        st.subheader("Dynamic Strategies")
+        _dyn_cols = st.columns(2)
+        with _dyn_cols[0]:
+            st.markdown("""
+**Regime-Based Allocation** — Classifies each month into one of four macro regimes
+(high/low inflation × high/low interest rates) using expanding-window medians.
+Optimises a separate portfolio per regime and switches at rebalance dates.
+""")
+        with _dyn_cols[1]:
+            st.markdown("""
+**DD P-Value Momentum** — Ranks each asset's current drawdown against its own history.
+Assets with unusually deep drawdowns (low p-value) get allocation bumps as buying opportunities.
+Uses an optimised bump schedule found via grid search over shape parameters.
 """)
 
-    st.subheader("Benchmark")
-    st.markdown("""
-**Dalio All Weather** is Ray Dalio's classic all-weather portfolio: 30% S&P 500, 40% Long-Term Treasuries,
-15% Short-Term Treasuries, 7.5% Gold, 7.5% Commodities. Included as a well-known benchmark for comparison.
+    st.divider()
+
+    with st.container():
+        st.subheader("Benchmark")
+        st.markdown("""
+**Dalio All Weather** — Ray Dalio's classic portfolio: 30% S&P 500, 40% LT Treasuries, 15% ST Treasuries, 7.5% Gold, 7.5% Commodities.
 """)
 
-    st.subheader("CFD Analysis")
-    st.markdown("""
-The **CFD Analysis** tab models what happens when you apply leverage to any portfolio using Contracts for
-Difference (CFDs). It accounts for margin requirements, financing costs, volatility drag, and sizes a
-cash reserve to survive the worst historical drawdown without a margin call.
+    st.divider()
 
-The **Monte Carlo Projection** simulates 2,000 forward paths using geometric Brownian motion calibrated
-to each portfolio's historical CAGR and volatility, showing the range of possible outcomes over 10 years.
+    with st.container():
+        st.subheader("CFD Analysis & Monte Carlo")
+        st.markdown("""
+The **CFD Analysis** tab models leveraged portfolios using CFDs. It sizes a cash reserve to survive the
+worst historical drawdown at the given leverage, accounts for financing costs and volatility drag.
+
+The **Monte Carlo Projection** runs 2,000 GBM paths calibrated to each portfolio's CAGR and volatility,
+showing the P5–P95 range of outcomes over 10 years for both unleveraged and leveraged positions.
 """)
+
+    st.divider()
+
+    with st.container():
+        st.subheader("Key Metrics")
+        _met_cols = st.columns(2)
+        with _met_cols[0]:
+            st.markdown("""
+**CAGR** — Compound annual growth rate (calendar-day annualised).
+
+**Sharpe Ratio** — (Arithmetic return − risk-free rate) / volatility.
+
+**Calmar Ratio** — CAGR / |max drawdown|.
+
+**Max Drawdown** — Largest peak-to-trough decline.
+""")
+        with _met_cols[1]:
+            st.markdown("""
+**Volatility** — Annualised standard deviation of daily returns (252 trading days).
+
+**Risk-Free Rate** — Used for Sharpe calculation and CFD cash reserve growth. Currently {:.1f}%.
+
+**Rebalancing** — How often portfolio weights are reset to targets. Weights drift between rebalances.
+""".format(risk_free_pct))
 
 # ──────────────────────────────────────────────
 # SETTINGS TAB

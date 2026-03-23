@@ -96,7 +96,10 @@ def analyze_cfd(
     gross_cagr = ((1.0 + stats.cagr) ** leverage_ratio
                   * np.exp(-leverage_ratio * (leverage_ratio - 1.0) * vol**2 / 2.0)
                   - 1.0)
-    financing_drag = financing_rate * (leverage_ratio - 1.0)
+    # CMC Markets charges financing on the FULL notional (not just borrowed portion).
+    # Annual drag = financing_rate × leverage (since notional = deployed × leverage).
+    # Expressed as drag on deployed capital: financing_rate × leverage.
+    financing_drag = financing_rate * leverage_ratio
     net_cagr = gross_cagr - financing_drag
 
     leveraged_vol = stats.volatility * leverage_ratio
