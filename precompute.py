@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
 from data import ASSETS, load_data
 from stats import calc_stats, compute_asset_starts

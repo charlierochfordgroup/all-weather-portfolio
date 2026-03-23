@@ -307,13 +307,33 @@ def _optimize_drawdown(
 
     # Add defensive starts: max-bond and max-cash-bond blends
     # These are the most likely to have very low drawdowns.
-    for bond_frac in [0.6, 0.8]:
+    for bond_frac in [0.4, 0.6, 0.8]:
         w_bond = np.full(n, (1.0 - bond_frac) / n)
         for i, a in enumerate(ASSETS):
             if GROUP_MAP[a] == "Bonds":
                 w_bond[i] = bond_frac / 3.0  # split across 3 bond assets
         w_bond = clip_normalize(w_bond, min_w, max_w, group_max)
         vol_candidates.append(w_bond)
+
+    # Cash-heavy start (cash + short-term treasuries)
+    w_cash = np.full(n, min_w.mean())
+    for i, a in enumerate(ASSETS):
+        if a in ("Cash", "Short-Term Treasuries"):
+            w_cash[i] = 0.30
+        elif a == "Gold":
+            w_cash[i] = 0.10
+    w_cash = clip_normalize(w_cash, min_w, max_w, group_max)
+    vol_candidates.append(w_cash)
+
+    # Min-vol result from Phase 1 with DD-focused SLSQP refinement
+    # Use more perturbations of the best vol candidate
+    if vol_candidates:
+        best_vol = min(vol_candidates, key=vol_obj)
+        for scale in [0.005, 0.01, 0.02, 0.03]:
+            for _ in range(3):
+                perturbed = best_vol + rng.normal(0, scale, n)
+                perturbed = clip_normalize(np.maximum(perturbed, 0), min_w, max_w, group_max)
+                vol_candidates.append(perturbed)
 
     # Phase 3: Evaluate true max-DD on ALL candidates and pick the best
     best_w = None
@@ -340,7 +360,7 @@ def _optimize_drawdown(
         try:
             result = minimize(
                 constrained_obj, best_w, method="Nelder-Mead",
-                options={"maxiter": 2000, "xatol": 1e-6, "fatol": 1e-9},
+                options={"maxiter": 5000, "xatol": 1e-7, "fatol": 1e-10},
             )
             w_nm = clip_normalize(result.x, min_w, max_w, group_max)
             val_nm = obj(w_nm)

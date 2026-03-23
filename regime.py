@@ -154,7 +154,7 @@ def optimize_per_regime(
         mask = regime_daily == label
         regime_returns = returns[mask]
 
-        if len(regime_returns) < 252:
+        if len(regime_returns) < 126:
             # Not enough data for meaningful 17-asset optimisation — use equal weight
             n = returns.shape[1]
             w = np.ones(n) / n
