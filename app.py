@@ -85,6 +85,7 @@ start_date = col1.date_input("Backtest Start", value=_start_default,
 end_date = col2.date_input("End Date", value=data_end,
                            min_value=data_start_earliest, max_value=data_end,
                            format="DD/MM/YYYY")
+# Inception — small text-link style right under backtest dates
 if st.sidebar.button("Inception", type="tertiary", use_container_width=False):
     st.session_state["_use_inception"] = True
     st.rerun()
@@ -525,7 +526,6 @@ if _macro_data is not None and "base_results" in st.session_state:
     st.session_state._regime_series = _regime_series
 
     # Only optimise regimes if we haven't cached them for this config
-    # Use a cache key WITHOUT btc flag so we can fast-path BTC exclusion
     _regime_base_key = _cache_key(f"regime_{overlap_start_date}_{dd_constraint_pct}", end_date, risk_free_rate, "daily")
     _regime_cache_key = f"{_regime_base_key}_btc={exclude_bitcoin}"
 
@@ -562,15 +562,30 @@ if _macro_data is not None and "base_results" in st.session_state:
                             dd_returns=returns, dd_asset_starts=bt_asset_starts,
                         )
         else:
-            with st.sidebar:
-                with st.spinner("Computing regime portfolios..."):
-                    _regime_weights = optimize_per_regime(
-                        opt_returns, _regime_series, "Max Sharpe Ratio",
-                        min_w_default, max_w_default, default_group_max,
-                        risk_free_rate, rebalance="daily",
-                        dd_constraint=dd_constraint_val,
-                        dd_returns=returns, dd_asset_starts=bt_asset_starts,
-                    )
+            # Try precomputed regime weights first (instant load)
+            _regime_weights = None
+            if _constraints_are_default() and PRECOMPUTED_FILE.exists():
+                try:
+                    with open(PRECOMPUTED_FILE, "rb") as f:
+                        _pre = pickle.load(f)
+                    _pre_rw_by_dd = _pre.get("regime_weights_by_dd", {})
+                    if dd_constraint_pct in _pre_rw_by_dd:
+                        _regime_weights = _pre_rw_by_dd[dd_constraint_pct]
+                    elif _pre.get("regime_weights") is not None:
+                        _regime_weights = _pre["regime_weights"]
+                except Exception:
+                    pass
+
+            if _regime_weights is None:
+                with st.sidebar:
+                    with st.spinner("Computing regime portfolios..."):
+                        _regime_weights = optimize_per_regime(
+                            opt_returns, _regime_series, "Max Sharpe Ratio",
+                            min_w_default, max_w_default, default_group_max,
+                            risk_free_rate, rebalance="daily",
+                            dd_constraint=dd_constraint_val,
+                            dd_returns=returns, dd_asset_starts=bt_asset_starts,
+                        )
         st.session_state._regime_weights = _regime_weights
         st.session_state._regime_cache_key = _regime_cache_key
     else:
@@ -744,7 +759,7 @@ def _make_pie_data(weights, threshold=0.03):
 # ──────────────────────────────────────────────
 # MAIN: TABS
 # ──────────────────────────────────────────────
-tab_compare, tab_dynamic, tab_cfd, tab_guide, tab_settings = st.tabs(["Compare", "Dynamic Strategies", "CFD Analysis", "Guide", "Settings"])
+tab_compare, tab_dynamic, tab_cfd, tab_guide, tab_settings = st.tabs(["Compare", "Dynamic Strategies", "CFD Analysis", "Methodology", "Settings"])
 
 # ======================================================================
 # TAB 1: COMPARE
@@ -1029,7 +1044,7 @@ with tab_dynamic:
                f"Max drawdown constraint ({dd_constraint_pct}%) applied to both strategies via sidebar.")
 
     # ── Section A: Regime-Based Allocation ──
-    st.header("Regime-Based Allocation")
+    st.subheader("Regime-Based Allocation")
     if not st.session_state.get("_macro_available", False):
         st.info("Regime data not available. Place 'Inflation and IR.xlsx' in the app directory with CPI and Fed Funds Rate data.")
     elif "_regime_series" in st.session_state and "_regime_weights" in st.session_state:
@@ -1037,12 +1052,12 @@ with tab_dynamic:
         _rw = st.session_state._regime_weights
         _analytics = regime_analytics(_rs, _rw, ASSETS)
 
-        # Current regime — large heading with regime name smaller
-        st.subheader("Current Regime")
-        st.markdown(f"**{REGIME_LABELS.get(_analytics['current_regime'], 'Unknown')}**")
+        # Current regime — heading is prominent, regime label is secondary
+        st.markdown("#### Current Regime")
+        st.markdown(f"*{REGIME_LABELS.get(_analytics['current_regime'], 'Unknown')}*")
 
         # Regime timeline
-        st.subheader("Regime Timeline")
+        st.markdown("#### Regime Timeline")
         fig_regime = go.Figure()
         _regime_colors = {1: "#FF1744", 2: "#FF6D00", 3: "#2962FF", 4: "#00C853"}
         _regime_daily = _rs.reindex(pd.date_range(_rs.index[0], _rs.index[-1], freq="MS")).ffill()
@@ -1152,6 +1167,8 @@ with tab_dynamic:
                     val = base * mult
                     if _rv_ymin <= val <= _rv_ymax:
                         _rv_ticks.append(val)
+            if not _rv_ticks:
+                _rv_ticks = [1]
             fig_rv.update_layout(
                 yaxis_type="log", yaxis_title="Growth of $1 (Log)",
                 xaxis_title="Date", hovermode="x unified",
@@ -1160,7 +1177,7 @@ with tab_dynamic:
                     tickmode="array",
                     tickvals=_rv_ticks,
                     ticktext=[_fmt_growth(v) for v in _rv_ticks],
-                    range=[np.log10(_rv_ymin), np.log10(_rv_ymax)],
+                    range=[np.log10(max(_rv_ymin, 0.1)), np.log10(max(_rv_ymax, 1.1))],
                     gridcolor="rgba(128,128,128,0.15)",
                 ),
             )
@@ -1169,7 +1186,7 @@ with tab_dynamic:
     st.markdown("---")
 
     # ── Section B: DD P-Value Momentum ──
-    st.header("Drawdown P-Value Momentum")
+    st.subheader("Drawdown P-Value Momentum")
     st.caption("Boosts allocation to assets with historically rare drawdowns (buying opportunities) "
                "and reduces allocation to assets near all-time highs.")
 
@@ -1265,6 +1282,8 @@ with tab_dynamic:
                     val = base * mult
                     if _ddv_ymin <= val <= _ddv_ymax:
                         _ddv_ticks.append(val)
+            if not _ddv_ticks:
+                _ddv_ticks = [1]
             fig_ddv.update_layout(
                 yaxis_type="log", yaxis_title="Growth of $1 (Log)",
                 xaxis_title="Date", hovermode="x unified",
@@ -1273,7 +1292,7 @@ with tab_dynamic:
                     tickmode="array",
                     tickvals=_ddv_ticks,
                     ticktext=[_fmt_growth(v) for v in _ddv_ticks],
-                    range=[np.log10(_ddv_ymin), np.log10(_ddv_ymax)],
+                    range=[np.log10(max(_ddv_ymin, 0.1)), np.log10(max(_ddv_ymax, 1.1))],
                     gridcolor="rgba(128,128,128,0.15)",
                 ),
             )
@@ -1441,17 +1460,15 @@ with tab_cfd:
         lev_vol = cfd_result.leveraged_volatility
 
         def _mc_fan_leveraged(deployed, reserve, cagr, vol, rf_rate):
-            """MC fan for leveraged portfolio: deployed grows via GBM, reserve earns rf."""
+            """MC fan for leveraged portfolio: deployed grows via GBM, reserve sits as cash (0% return)."""
             daily_mu = np.log(1.0 + cagr) / 252.0
             daily_sigma = vol / np.sqrt(252.0)
             daily_log_ret = daily_mu + daily_sigma * z
             cum_log = np.cumsum(daily_log_ret, axis=1)
             cum_log = np.hstack([np.zeros((n_paths, 1)), cum_log])
             deployed_paths = deployed * np.exp(cum_log)
-            # Reserve grows at risk-free rate
-            rf_daily = np.log(1.0 + rf_rate) / 252.0
-            reserve_growth = reserve * np.exp(rf_daily * np.arange(n_days_mc + 1))
-            total_paths = deployed_paths + reserve_growth[np.newaxis, :]
+            # Reserve earns 0% — CMC Markets does not pay interest on idle cash
+            total_paths = deployed_paths + reserve
             p5 = np.percentile(total_paths, 5, axis=0)
             p25 = np.percentile(total_paths, 25, axis=0)
             p50 = np.percentile(total_paths, 50, axis=0)
@@ -1557,7 +1574,8 @@ with tab_cfd:
         )
         st.plotly_chart(fig_mc, width="stretch")
         st.caption("Shaded bands: P5–P95 (light) and P25–P75 (dark). Solid line: median (P50). "
-                   "Leveraged returns account for volatility drag (L(L-1)σ²/2) and financing costs on borrowed notional.")
+                   "Leveraged returns account for volatility drag (L(L-1)σ²/2) and financing costs on full notional. "
+                   "Cash reserve earns 0% (CMC does not pay interest on idle cash).")
 
         # ── 10-Year Median Projection Table (all portfolios) ──
         st.markdown("---")
@@ -1572,9 +1590,8 @@ with tab_cfd:
             daily_log_ret = daily_mu + daily_sigma * z  # reuse the shared z matrix
             cum_log = np.sum(daily_log_ret, axis=1)  # sum over all days for final value
             deployed_final = start_val * np.exp(cum_log)
-            # Add reserve grown at risk-free rate over 10 years
-            reserve_final = reserve * (1.0 + rf_rate) ** n_years
-            final_vals = deployed_final + reserve_final
+            # Reserve earns 0% — CMC does not pay interest on idle cash
+            final_vals = deployed_final + reserve
             return round(np.median(final_vals))
 
         proj_rows = []
@@ -1618,103 +1635,79 @@ with tab_cfd:
         )
 
 # ──────────────────────────────────────────────
-# STRATEGY GUIDE TAB
+# METHODOLOGY TAB
 # ──────────────────────────────────────────────
 with tab_guide:
-    st.header("Guide")
+    st.header("Methodology")
+    st.caption("How each portfolio strategy works, what the key metrics mean, and how the analysis tools are built.")
 
-    with st.container():
-        st.subheader("Static Strategies")
-        _guide_cols = st.columns(2)
-        with _guide_cols[0]:
-            st.markdown("""
-**Max Sharpe Ratio** — Maximises return per unit of risk (return above risk-free rate / volatility).
+    # ── Optimisation Strategies ──
+    with st.expander("Optimisation Strategies", expanded=True):
+        st.markdown(
+            "**Max Sharpe Ratio** maximises return per unit of risk. "
+            "**Min Volatility** targets the lowest portfolio standard deviation. "
+            "**Max Calmar Ratio** maximises return relative to worst drawdown. "
+            "**Minimize Max Drawdown** directly targets the smallest peak-to-trough loss."
+        )
+        st.markdown(
+            "**Inverse Volatility** weights assets inversely to their vol — simple and transparent. "
+            "**Equal Risk Contribution** equalises each asset's risk contribution, accounting for correlations. "
+            "**Hierarchical Risk Parity** clusters correlated assets and allocates top-down for robustness."
+        )
 
-**Min Volatility** — Lowest possible portfolio standard deviation. Smoothest ride, potentially lower returns.
+    # ── Drawdown-Constrained ──
+    with st.expander("Drawdown-Constrained Strategies"):
+        st.markdown(
+            f"**Max Sharpe (DD ≤ X%)** and **Max Calmar (DD ≤ X%)** add a drawdown penalty "
+            f"to their unconstrained counterparts. Currently set to **{dd_constraint_pct}%** via the sidebar."
+        )
 
-**Max Calmar Ratio** — Maximises return relative to worst drawdown. Balances growth with downside protection.
+    # ── Dynamic Strategies ──
+    with st.expander("Dynamic Strategies"):
+        st.markdown(
+            "**Regime-Based Allocation** classifies each month into one of four macro regimes "
+            "(high/low inflation crossed with high/low interest rates) using expanding-window medians. "
+            "A separate portfolio is optimised per regime; weights switch at rebalance dates."
+        )
+        st.markdown(
+            "**DD P-Value Momentum** ranks each asset's current drawdown against its own history. "
+            "Assets with historically rare drawdowns (low p-value) receive allocation bumps. "
+            "The bump schedule shape is optimised via grid search to maximise CAGR."
+        )
 
-**Minimize Max Drawdown** — Directly targets the smallest worst-case peak-to-trough loss.
-""")
-        with _guide_cols[1]:
-            st.markdown("""
-**Inverse Volatility** — Weights assets inversely to their volatility. Simple, transparent rule.
+    # ── Benchmark ──
+    with st.expander("Benchmark"):
+        st.markdown(
+            "**Dalio All Weather** — Ray Dalio's classic: 30% S&P 500, 40% LT Treasuries, "
+            "15% ST Treasuries, 7.5% Gold, 7.5% Commodities."
+        )
 
-**Equal Risk Contribution** — Each asset contributes equal risk. Accounts for correlations unlike inverse vol.
+    # ── CFD & Monte Carlo ──
+    with st.expander("CFD Analysis & Monte Carlo"):
+        st.markdown(
+            "The CFD tab models leveraged positions with margin requirements and financing costs. "
+            "A cash reserve is sized to survive the worst historical drawdown at the given leverage. "
+            "Financing is charged on the full notional value (rate × leverage), matching CMC Markets."
+        )
+        st.markdown(
+            "The Monte Carlo projection runs 2,000 GBM paths calibrated to each portfolio's CAGR and "
+            "volatility, showing P5–P95 outcomes over 10 years. Leveraged returns account for volatility "
+            "drag and financing costs. The cash reserve earns 0% (CMC does not pay interest on idle cash)."
+        )
 
-**Hierarchical Risk Parity** — Clusters similar assets, allocates top-down. More robust to estimation error.
-""")
-
-    st.divider()
-
-    with st.container():
-        st.subheader("Drawdown-Constrained Strategies")
-        st.markdown(f"""
-**Max Sharpe (DD ≤ X%)** and **Max Calmar (DD ≤ X%)** add a drawdown penalty to their unconstrained
-counterparts. Currently set to **{dd_constraint_pct}%** — trades some return for downside protection.
-""")
-
-    st.divider()
-
-    with st.container():
-        st.subheader("Dynamic Strategies")
-        _dyn_cols = st.columns(2)
-        with _dyn_cols[0]:
-            st.markdown("""
-**Regime-Based Allocation** — Classifies each month into one of four macro regimes
-(high/low inflation × high/low interest rates) using expanding-window medians.
-Optimises a separate portfolio per regime and switches at rebalance dates.
-""")
-        with _dyn_cols[1]:
-            st.markdown("""
-**DD P-Value Momentum** — Ranks each asset's current drawdown against its own history.
-Assets with unusually deep drawdowns (low p-value) get allocation bumps as buying opportunities.
-Uses an optimised bump schedule found via grid search over shape parameters.
-""")
-
-    st.divider()
-
-    with st.container():
-        st.subheader("Benchmark")
-        st.markdown("""
-**Dalio All Weather** — Ray Dalio's classic portfolio: 30% S&P 500, 40% LT Treasuries, 15% ST Treasuries, 7.5% Gold, 7.5% Commodities.
-""")
-
-    st.divider()
-
-    with st.container():
-        st.subheader("CFD Analysis & Monte Carlo")
-        st.markdown("""
-The **CFD Analysis** tab models leveraged portfolios using CFDs. It sizes a cash reserve to survive the
-worst historical drawdown at the given leverage, accounts for financing costs and volatility drag.
-
-The **Monte Carlo Projection** runs 2,000 GBM paths calibrated to each portfolio's CAGR and volatility,
-showing the P5–P95 range of outcomes over 10 years for both unleveraged and leveraged positions.
-""")
-
-    st.divider()
-
-    with st.container():
-        st.subheader("Key Metrics")
-        _met_cols = st.columns(2)
-        with _met_cols[0]:
-            st.markdown("""
-**CAGR** — Compound annual growth rate (calendar-day annualised).
-
-**Sharpe Ratio** — (Arithmetic return − risk-free rate) / volatility.
-
-**Calmar Ratio** — CAGR / |max drawdown|.
-
-**Max Drawdown** — Largest peak-to-trough decline.
-""")
-        with _met_cols[1]:
-            st.markdown("""
-**Volatility** — Annualised standard deviation of daily returns (252 trading days).
-
-**Risk-Free Rate** — Used for Sharpe calculation and CFD cash reserve growth. Currently {:.1f}%.
-
-**Rebalancing** — How often portfolio weights are reset to targets. Weights drift between rebalances.
-""".format(risk_free_pct))
+    # ── Key Metrics ──
+    with st.expander("Key Metrics"):
+        _met_data = [
+            ("CAGR", "Compound annual growth rate, calendar-day annualised"),
+            ("Sharpe Ratio", f"(Arithmetic return − {risk_free_pct:.1f}% RFR) / volatility"),
+            ("Calmar Ratio", "CAGR / |max drawdown|"),
+            ("Max Drawdown", "Largest peak-to-trough decline over the backtest"),
+            ("Volatility", "Annualised standard deviation of daily returns (252 trading days)"),
+            ("Risk-Free Rate", f"Currently {risk_free_pct:.1f}%. Used for Sharpe ratio and as the CFD benchmark"),
+            ("Rebalancing", "How often weights reset to targets. Weights drift between rebalances"),
+        ]
+        _met_df = pd.DataFrame(_met_data, columns=["Metric", "Definition"])
+        st.dataframe(_met_df, hide_index=True, width="stretch")
 
 # ──────────────────────────────────────────────
 # SETTINGS TAB
