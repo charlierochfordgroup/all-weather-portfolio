@@ -125,19 +125,33 @@ def main():
     print(f"  {len(dd_adj)} annual checkpoints computed")
 
     # Regime: optimise per regime if macro data available
+    # Pre-compute for each DD constraint level so the app doesn't have to
     macro_path = Path(__file__).resolve().parent / "Inflation and IR.xlsx"
     macro_data = load_regime_data(macro_path)
     regime_weights = None
     regime_series = None
+    regime_weights_by_dd = {}
     if macro_data is not None:
         print("\nComputing regime portfolios...")
         regime_series = classify_regimes(macro_data)
+        # Unconstrained (for backward compat)
         regime_weights = optimize_per_regime(
             opt_returns, regime_series, "Max Sharpe Ratio",
             min_w, max_w, group_max, rf, rebalance="daily",
         )
         for label_id, w in regime_weights.items():
-            print(f"  Regime {label_id}: done")
+            print(f"  Regime {label_id} (unconstrained): done")
+        # Per DD level
+        for dd_pct in DD_LEVELS:
+            dd_val = dd_pct / 100.0
+            print(f"  Regime weights with DD≤{dd_pct}%...")
+            rw = optimize_per_regime(
+                opt_returns, regime_series, "Max Sharpe Ratio",
+                min_w, max_w, group_max, rf, rebalance="daily",
+                dd_constraint=dd_val,
+                dd_returns=bt_returns, dd_asset_starts=bt_asset_starts,
+            )
+            regime_weights_by_dd[dd_pct] = rw
     else:
         print("\nNo macro data found — skipping regime pre-computation")
 
@@ -148,6 +162,7 @@ def main():
         "dd_momentum_adjustments": dd_adj,
         "dd_momentum_base": ms_weights,
         "regime_weights": regime_weights,
+        "regime_weights_by_dd": regime_weights_by_dd,
         "regime_series": regime_series,
         "overlap_start": overlap_start,
         "data_end": returns_full.index[-1],
