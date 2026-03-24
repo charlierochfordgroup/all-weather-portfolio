@@ -87,30 +87,18 @@ def classify_regimes(macro_data: pd.DataFrame) -> pd.Series:
     """
     MIN_HISTORY = 24  # need at least 2 years for stable median
 
+    # Vectorised expanding-window medians (C-implemented, much faster than Python loop)
+    cpi_expanding_med = macro_data["CPI"].expanding(min_periods=MIN_HISTORY).median()
+    ff_expanding_med = macro_data["FedFunds"].expanding(min_periods=MIN_HISTORY).median()
+
+    high_inf = macro_data["CPI"] > cpi_expanding_med
+    high_ir = macro_data["FedFunds"] > ff_expanding_med
+
     regime = pd.Series(4, index=macro_data.index, dtype=int)  # default: low/low
-
-    cpi_vals = macro_data["CPI"].values
-    ff_vals = macro_data["FedFunds"].values
-
-    for t in range(len(macro_data)):
-        if t + 1 < MIN_HISTORY:
-            continue  # not enough history yet
-
-        # Expanding-window medians: use only data up to and including time t
-        cpi_median = np.median(cpi_vals[: t + 1])
-        ff_median = np.median(ff_vals[: t + 1])
-
-        high_inf = cpi_vals[t] > cpi_median
-        high_ir = ff_vals[t] > ff_median
-
-        if high_inf and high_ir:
-            regime.iloc[t] = 1
-        elif high_inf and not high_ir:
-            regime.iloc[t] = 2
-        elif not high_inf and high_ir:
-            regime.iloc[t] = 3
-        else:
-            regime.iloc[t] = 4
+    regime[high_inf & high_ir] = 1
+    regime[high_inf & ~high_ir] = 2
+    regime[~high_inf & high_ir] = 3
+    # regime 4 is the default (low/low) – already set
 
     # Forward-fill the first valid classification to cover the initial warm-up period
     if len(macro_data) >= MIN_HISTORY:

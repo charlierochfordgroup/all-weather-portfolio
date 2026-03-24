@@ -61,6 +61,7 @@ class PortfolioStats:
     worst_year: float = 0.0
     pct_positive: float = 0.0
     longest_dd: int = 0
+    current_drawdown: float = 0.0
 
 
 # Map rebalance labels to pandas period frequencies
@@ -130,10 +131,11 @@ def _periodic_rebal_returns(
     has_eff = eff_weights is not None
     has_schedule = weights_schedule is not None
 
-    # Pre-sort schedule dates for faster lookup
+    # Pre-sort schedule dates and convert to int64 for fast searchsorted lookup
     if has_schedule:
         sorted_sched_dates = sorted(weights_schedule.keys())
         sorted_sched_weights = [weights_schedule[d] for d in sorted_sched_dates]
+        _sched_ts = np.array([d.value for d in sorted_sched_dates], dtype=np.int64)
 
     for seg_start, seg_end in zip(
         boundaries, np.append(boundaries[1:], n_days)
@@ -141,12 +143,11 @@ def _periodic_rebal_returns(
         # Determine target weights at this boundary
         if has_schedule:
             boundary_date = returns.index[seg_start]
-            # Binary search for most recent schedule entry
+            # Fast binary search for most recent schedule entry
             target_w = weights.copy()
-            for i in range(len(sorted_sched_dates) - 1, -1, -1):
-                if sorted_sched_dates[i] <= boundary_date:
-                    target_w = sorted_sched_weights[i].copy()
-                    break
+            _idx = np.searchsorted(_sched_ts, boundary_date.value, side='right') - 1
+            if _idx >= 0:
+                target_w = sorted_sched_weights[_idx].copy()
         else:
             target_w = weights
 
@@ -262,14 +263,18 @@ def calc_stats(
     drawdowns = idx_nz / peak - 1.0
     max_dd = np.min(drawdowns) if len(drawdowns) > 0 else 0.0
 
-    dd_days = 0
-    longest_dd = 0
-    for i in range(len(idx_nz)):
-        if idx_nz[i] < peak[i]:
-            dd_days += 1
-            longest_dd = max(longest_dd, dd_days)
-        else:
-            dd_days = 0
+    # Vectorised longest drawdown: find max consecutive run where idx < peak
+    in_dd = idx_nz < peak
+    if np.any(in_dd):
+        changes = np.diff(np.concatenate(([False], in_dd, [False])).astype(np.int8))
+        run_starts = np.where(changes == 1)[0]
+        run_ends = np.where(changes == -1)[0]
+        longest_dd = int(np.max(run_ends - run_starts))
+    else:
+        longest_dd = 0
+
+    # Current drawdown: latest equity value relative to peak
+    current_dd = drawdowns[-1] if len(drawdowns) > 0 else 0.0
 
     # Calmar
     calmar = cagr / abs(max_dd) if abs(max_dd) > 1e-4 else 0.0
@@ -311,6 +316,7 @@ def calc_stats(
         worst_year=worst_year,
         pct_positive=pct_pos,
         longest_dd=longest_dd,
+        current_drawdown=current_dd,
     )
 
 

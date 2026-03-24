@@ -46,41 +46,23 @@ def detect_drawdown_episodes(
         return []
     abs_threshold = abs(max_dd) * relative_threshold
 
-    # Identify episodes: contiguous stretches where dd < 0
+    # Vectorised episode detection: find contiguous stretches where dd < 0
+    in_dd_mask = dd < 0
+    padded = np.concatenate(([False], in_dd_mask, [False]))
+    changes = np.diff(padded.astype(np.int8))
+    ep_starts = np.where(changes == 1)[0]
+    ep_ends = np.where(changes == -1)[0]
+
     episodes = []
-    in_dd = False
-    ep_start = None
-    ep_trough_idx = None
-    ep_trough_val = 0.0
-
-    for i in range(len(dd)):
-        if dd[i] < 0:
-            if not in_dd:
-                in_dd = True
-                ep_start = i
-                ep_trough_idx = i
-                ep_trough_val = dd[i]
-            elif dd[i] < ep_trough_val:
-                ep_trough_idx = i
-                ep_trough_val = dd[i]
-        else:
-            if in_dd:
-                # Episode ended — record if significant enough
-                if abs(ep_trough_val) >= abs_threshold:
-                    episodes.append({
-                        "start": dates[ep_start],
-                        "trough": dates[ep_trough_idx],
-                        "depth": ep_trough_val,
-                    })
-                in_dd = False
-
-    # Handle ongoing drawdown at end of series
-    if in_dd and abs(ep_trough_val) >= abs_threshold:
-        episodes.append({
-            "start": dates[ep_start],
-            "trough": dates[ep_trough_idx],
-            "depth": ep_trough_val,
-        })
+    for s, e in zip(ep_starts, ep_ends):
+        trough_idx = s + np.argmin(dd[s:e])
+        trough_val = dd[trough_idx]
+        if abs(trough_val) >= abs_threshold:
+            episodes.append({
+                "start": dates[s],
+                "trough": dates[trough_idx],
+                "depth": trough_val,
+            })
 
     return episodes
 
@@ -234,11 +216,22 @@ def compute_dd_adjustments_scheduled(
 def build_dd_momentum_schedule(
     base_weights: np.ndarray,
     adjustments: dict[pd.Timestamp, np.ndarray],
+    dd_constraint: float | None = None,
+    returns: pd.DataFrame | None = None,
+    risk_free_rate: float = 0.04,
+    rebalance: str = "annual",
+    asset_starts: dict | None = None,
 ) -> dict[pd.Timestamp, np.ndarray]:
     """Build time-varying weight schedule from base weights and adjustments.
 
-    adjusted = base_weights * (1 + adjustment_factor), clipped and normalized.
+    adjusted = base_weights * (1 + adjustment_factor), clipped and normalised.
+
+    If dd_constraint is set and returns are provided, enforces the max drawdown
+    constraint by scaling back adjustment factors via binary search when the
+    resulting portfolio exceeds the limit.
     """
+    from stats import calc_stats
+
     schedule = {}
     for date, adj in adjustments.items():
         adjusted = base_weights * (1.0 + adj)
@@ -249,6 +242,39 @@ def build_dd_momentum_schedule(
         else:
             adjusted = base_weights.copy()
         schedule[date] = adjusted
+
+        # Enforce DD constraint: if the schedule so far exceeds the limit,
+        # scale back this checkpoint's adjustments via binary search.
+        if dd_constraint is not None and returns is not None:
+            s = calc_stats(
+                returns, base_weights, risk_free_rate,
+                rebalance=rebalance, asset_starts=asset_starts,
+                weights_schedule=schedule,
+            )
+            if abs(s.max_drawdown) > dd_constraint:
+                lo, hi = 0.0, 1.0
+                for _ in range(10):
+                    mid = (lo + hi) / 2.0
+                    scaled = base_weights * (1.0 + adj * mid)
+                    scaled = np.maximum(scaled, 0.0)
+                    t = scaled.sum()
+                    scaled = scaled / t if t > 1e-12 else base_weights.copy()
+                    schedule[date] = scaled
+                    s2 = calc_stats(
+                        returns, base_weights, risk_free_rate,
+                        rebalance=rebalance, asset_starts=asset_starts,
+                        weights_schedule=schedule,
+                    )
+                    if abs(s2.max_drawdown) > dd_constraint:
+                        hi = mid
+                    else:
+                        lo = mid
+                # Use the conservative (lower) scaling factor
+                final_scaled = base_weights * (1.0 + adj * lo)
+                final_scaled = np.maximum(final_scaled, 0.0)
+                t = final_scaled.sum()
+                schedule[date] = final_scaled / t if t > 1e-12 else base_weights.copy()
+
     return schedule
 
 

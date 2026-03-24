@@ -492,15 +492,39 @@ if "base_results" in st.session_state and "Max Sharpe Ratio" in st.session_state
         if len(yr_dates) > 0:
             _checkpoints.append(yr_dates[0])  # first trading day of each year
 
-    # Use optimised per-rank bump schedule if available, otherwise default parametric
-    _optimal_bump_sched = load_optimal_bump_schedule()
-    if _optimal_bump_sched is not None:
-        _dd_adj = compute_dd_adjustments_scheduled(returns, _checkpoints, _optimal_bump_sched)
+    # Cache DD momentum adjustments to avoid recomputing on every page load
+    _dd_adj_cache_key = f"dd_adj_{cache_key}"
+    if st.session_state.get("_dd_adj_key") == _dd_adj_cache_key:
+        _dd_adj = st.session_state._dd_adj_cached
     else:
-        _dd_adj = compute_dd_adjustments(returns, _checkpoints)
-    _dd_schedule = build_dd_momentum_schedule(_ms_weights, _dd_adj)
+        _dd_adj = None
+        # Try precomputed adjustments first (instant load on default settings)
+        if _constraints_are_default() and PRECOMPUTED_FILE.exists():
+            try:
+                with open(PRECOMPUTED_FILE, "rb") as f:
+                    _pre_dd = pickle.load(f)
+                _dd_adj = _pre_dd.get("dd_momentum_adjustments")
+            except Exception:
+                pass
+        if _dd_adj is None:
+            _optimal_bump_sched = load_optimal_bump_schedule()
+            if _optimal_bump_sched is not None:
+                _dd_adj = compute_dd_adjustments_scheduled(returns, _checkpoints, _optimal_bump_sched)
+            else:
+                _dd_adj = compute_dd_adjustments(returns, _checkpoints)
+        st.session_state._dd_adj_cached = _dd_adj
+        st.session_state._dd_adj_key = _dd_adj_cache_key
 
     _rebal_for_dynamic = rebalance if rebalance != "daily" else "annual"
+    _dd_schedule = build_dd_momentum_schedule(
+        _ms_weights, _dd_adj,
+        dd_constraint=dd_constraint_val,
+        returns=returns,
+        risk_free_rate=risk_free_rate,
+        rebalance=_rebal_for_dynamic,
+        asset_starts=bt_asset_starts,
+    )
+
     _dd_stats = calc_stats(
         returns, _ms_weights, risk_free_rate,
         rebalance=_rebal_for_dynamic, asset_starts=bt_asset_starts,
@@ -631,6 +655,7 @@ def _stats_row_numeric(s):
         "Volatility": s.volatility * 100,
         "Sharpe": s.sharpe,
         "Max Drawdown": s.max_drawdown * 100,
+        "Current DD": s.current_drawdown * 100,
         "Calmar": s.calmar,
         "Best Year": s.best_year * 100,
         "Worst Year": s.worst_year * 100,
@@ -643,12 +668,25 @@ _STATS_COL_CONFIG = {
     "Volatility": st.column_config.NumberColumn("Volatility", format="%.2f%%"),
     "Sharpe": st.column_config.NumberColumn("Sharpe", format="%.2f"),
     "Max Drawdown": st.column_config.NumberColumn("Max Drawdown", format="%.2f%%"),
+    "Current DD": st.column_config.NumberColumn("Current DD", format="%.1f%%"),
     "Calmar": st.column_config.NumberColumn("Calmar", format="%.2f"),
     "Best Year": st.column_config.NumberColumn("Best Year", format="%.2f%%"),
     "Worst Year": st.column_config.NumberColumn("Worst Year", format="%.2f%%"),
     "% Pos Days": st.column_config.NumberColumn("% Pos Days", format="%.2f%%"),
     "Longest DD": st.column_config.NumberColumn("Longest DD", format="%d days"),
 }
+
+
+def _style_current_dd(val):
+    """Conditional background colour for Current DD column."""
+    if not isinstance(val, (int, float)):
+        return ""
+    if val >= -0.01:
+        return "background-color: rgba(0, 200, 83, 0.2)"   # green – at peak
+    elif val >= -10.0:
+        return "background-color: rgba(255, 165, 0, 0.2)"   # amber – shallow
+    else:
+        return "background-color: rgba(255, 23, 68, 0.2)"   # red – deep
 
 
 def _risk_analytics(weights, label="Portfolio"):
@@ -777,8 +815,10 @@ with tab_compare:
         for pname, pdata in st.session_state.portfolios.items():
             comp_rows.append({"Strategy": pname, **_stats_row_numeric(pdata["stats"])})
         comp_df = pd.DataFrame(comp_rows)
+        # Apply conditional colour-coding to Current DD column
+        comp_styled = comp_df.style.applymap(_style_current_dd, subset=["Current DD"])
         st.dataframe(
-            comp_df,
+            comp_styled,
             column_config={"Strategy": st.column_config.TextColumn("Strategy"), **_STATS_COL_CONFIG},
             width="stretch",
             hide_index=True,
@@ -1409,6 +1449,62 @@ with tab_cfd:
             width="stretch",
             hide_index=True,
         )
+
+        # ── CMC Markets Financing Rate Reference ──
+        st.markdown("---")
+        with st.expander("CMC Markets Financing Rate Reference", expanded=False):
+            st.markdown(
+                "CFD financing is charged **daily** on the full notional value of open positions held overnight. "
+                "The rate comprises a benchmark interbank rate plus a CMC spread (typically 2.5% p.a.)."
+            )
+            _fin_rates = [
+                ("Cash", "N/A", "N/A", "N/A", "Not a CFD position"),
+                ("Nasdaq", "Index CFD", "Interbank + 2.5% (~7.0%)", "Interbank \u2013 2.5%", "Fed Funds benchmark"),
+                ("S&P 500", "Index CFD", "Interbank + 2.5% (~7.0%)", "Interbank \u2013 2.5%", "Fed Funds benchmark"),
+                ("Russell 2000", "Index CFD", "Interbank + 2.5% (~7.0%)", "Interbank \u2013 2.5%", "Fed Funds benchmark"),
+                ("ASX200", "Index CFD", "Interbank + 2.5% (~6.6%)", "Interbank \u2013 2.5%", "RBA cash rate benchmark"),
+                ("Emerging Markets", "Index CFD", "Interbank + 2.5% (~7.0%)", "Interbank \u2013 2.5%", "USD benchmark (typical)"),
+                ("Corporate Bonds", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
+                ("Long-Term Treasuries", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
+                ("Short-Term Treasuries", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
+                ("Real Estate", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
+                ("Commodities", "Commodity CFD", "Built into spread", "Built into spread", "Forward-based pricing"),
+                ("Gold", "Commodity CFD", "SOFR + spread (~6.8%)", "SOFR \u2013 spread", "Precious metals pricing"),
+                ("Bitcoin", "Crypto CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Higher spreads typical"),
+                ("Infrastructure", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
+                ("Japan Equities", "Index CFD", "Interbank + 2.5% (~3.0%)", "Interbank \u2013 2.5%", "BoJ rate benchmark"),
+                ("UK Equities", "Index CFD", "Interbank + 2.5% (~7.0%)", "Interbank \u2013 2.5%", "BoE rate benchmark"),
+                ("EU Equities", "Index CFD", "Interbank + 2.5% (~5.2%)", "Interbank \u2013 2.5%", "ECB refi rate benchmark"),
+            ]
+            _fin_df = pd.DataFrame(_fin_rates, columns=["Asset", "CMC Product Type", "Long Rate", "Short Rate", "Notes"])
+            st.dataframe(_fin_df, hide_index=True, width="stretch")
+
+            st.markdown(
+                "**Additional notes:**\n"
+                "- Charged/credited daily at 5pm New York time. Weekend = 3\u00d7 daily charge (Wed or Thu depending on product).\n"
+                "- Short share positions may attract additional borrowing fees for hard-to-borrow stocks.\n"
+                "- AU share CFD commission: 0.10% per side (min $10 AUD). US share CFDs: US$0.02/share (min $10 USD).\n"
+                "- If interbank rate \u2264 2.5%, short positions may incur a charge rather than receiving a credit.\n"
+                "- Rates are indicative as at March 2026 \u2013 verify on CMC\u2019s platform."
+            )
+
+            st.subheader("Daily Financing Cost Calculator")
+            _calc_cols = st.columns(3)
+            with _calc_cols[0]:
+                _calc_notional = st.number_input(
+                    "Notional Position Value ($)", value=50000, min_value=0, step=1000,
+                    key="fin_calc_notional",
+                )
+            with _calc_cols[1]:
+                _calc_rate = st.number_input(
+                    "Annual Financing Rate (%)", value=7.0, min_value=0.0, max_value=20.0,
+                    step=0.1, format="%.1f", key="fin_calc_rate",
+                )
+            with _calc_cols[2]:
+                _calc_daily = _calc_notional * (_calc_rate / 100.0) / 365.0
+                _calc_monthly = _calc_daily * 21  # 21 trading days
+                st.metric("Daily Cost", f"${_calc_daily:.2f} AUD")
+                st.metric("Monthly Cost (21 trading days)", f"${_calc_monthly:.2f} AUD")
 
         # ── Monte Carlo: Leveraged vs Unleveraged forward projection ──
         st.markdown("---")

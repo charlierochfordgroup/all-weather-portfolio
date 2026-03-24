@@ -361,8 +361,8 @@ class TestCFD:
             financing_rate=0.06, margin_requirement=0.20,
             risk_free_rate=0.04,
         )
-        # Financing drag = rate * (leverage - 1)
-        expected_drag = 0.06 * 2.0
+        # CMC charges financing on full notional: drag = rate * leverage
+        expected_drag = 0.06 * 3.0
         assert abs(result.financing_drag - expected_drag) < 1e-6
 
     def test_gross_cagr(self):
@@ -392,7 +392,8 @@ class TestCFD:
             financing_rate=0.06, margin_requirement=0.20,
             risk_free_rate=0.04,
         )
-        expected_net = result.gross_cagr - 0.06 * 2.0
+        # CMC charges financing on full notional: drag = rate * leverage
+        expected_net = result.gross_cagr - 0.06 * 3.0
         assert abs(result.net_cagr - expected_net) < 1e-6
 
     def test_no_leverage(self):
@@ -405,9 +406,9 @@ class TestCFD:
             financing_rate=0.06, margin_requirement=0.20,
             risk_free_rate=0.04,
         )
-        # With 1x leverage, financing drag should be 0 and CAGR unchanged
-        # (1+CAGR)^1 * exp(0) - 1 = CAGR
-        assert abs(result.financing_drag) < 1e-6
+        # At 1x leverage, CMC still charges financing on full notional:
+        # drag = rate * 1.0 = 0.06. Gross CAGR unscaled (vol drag term = 0).
+        assert abs(result.financing_drag - 0.06) < 1e-6
         assert abs(result.gross_cagr - stats.cagr) < 1e-6
 
     def test_capital_per_asset_sums(self):
@@ -796,7 +797,8 @@ class TestAuditCFDConsistency:
     """Cross-module consistency tests from audit."""
 
     def test_cfd_1x_leverage_matches_unleveraged(self):
-        """Audit gap: 1x leverage CFD should exactly match unleveraged stats."""
+        """Audit: 1x leverage CFD has same gross CAGR and vol as unleveraged,
+        but still incurs financing drag on the full notional (CMC model)."""
         from cfd import analyze_cfd
         from stats import PortfolioStats
         s = PortfolioStats(cagr=0.10, volatility=0.15, sharpe=0.40,
@@ -806,8 +808,9 @@ class TestAuditCFDConsistency:
         w = _equal_weights()
         result = analyze_cfd(w, s, 100000, 1.0, 0.06, 0.20, 0.04)
         assert abs(result.gross_cagr - s.cagr) < 1e-10
-        assert abs(result.financing_drag) < 1e-10
-        assert abs(result.net_cagr - s.cagr) < 1e-10
+        # CMC charges financing on full notional even at 1x: drag = rate * 1.0
+        assert abs(result.financing_drag - 0.06) < 1e-10
+        assert abs(result.net_cagr - (s.cagr - 0.06)) < 1e-10
         assert abs(result.leveraged_volatility - s.volatility) < 1e-10
 
     def test_cfd_extreme_leverage_vol_drag(self):
