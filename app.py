@@ -133,11 +133,27 @@ tv_dd_constraint_pct = st.sidebar.selectbox(
 tv_dd_constraint_val = tv_dd_constraint_pct / 100.0
 exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=False)
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Leverage Settings**")
+cfd_leverage_opt = st.sidebar.number_input(
+    "Target Leverage (x)", min_value=1.0, max_value=10.0, value=3.0, step=0.5,
+    key="cfd_leverage_opt",
+    help="Used by Leverage-Optimal and Carry-Adjusted RP strategies.",
+)
+cfd_financing_opt = st.sidebar.number_input(
+    "Financing Rate (% p.a.)", min_value=0.0, max_value=15.0, value=6.5, step=0.5,
+    key="cfd_financing_opt",
+    help="Annual CFD financing rate for leverage-aware strategies.",
+) / 100.0
+
 # Base strategies (always computed once)
 _BASE_TARGETS = [
     "Max Sharpe Ratio", "Min Volatility", "Max Calmar Ratio",
     "Minimize Max Drawdown",
     "Inverse Volatility", "Equal Risk Contribution", "Hierarchical Risk Parity",
+    "Leverage-Optimal",
+    "Carry-Adjusted Risk Parity",
+    "Adaptive Lookback Blend",
 ]
 
 # DD-constrained targets (computed for each DD level)
@@ -233,7 +249,8 @@ def _cache_key(sd, ed, rf, rb):
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
-def _compute_all(opt_data, bt_data, rf, rb, a_starts):
+def _compute_all(opt_data, bt_data, rf, rb, a_starts,
+                  leverage=1.0, financing_rate=0.065):
     """Compute base strategies + DD-constrained variants for all DD levels.
 
     opt_data:  returns for the overlap period (used by the optimiser).
@@ -252,11 +269,13 @@ def _compute_all(opt_data, bt_data, rf, rb, a_starts):
                 opt_data, tgt, min_w_default, max_w_default, default_group_max,
                 rf, rebalance="daily",
                 dd_returns=bt_data, dd_asset_starts=a_starts,
+                leverage=leverage, financing_rate=financing_rate,
             )
         else:
             w = run_optimization(
                 opt_data, tgt, min_w_default, max_w_default, default_group_max,
                 rf, rebalance="daily",
+                leverage=leverage, financing_rate=financing_rate,
             )
         s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
         base_results[tgt] = {"weights": w, "stats": s}
@@ -397,6 +416,17 @@ def _load_or_compute(opt_data, bt_data, rf, rb,
                 pre = pickle.load(f)
             base_results, dd_results = _stats_from_weights(
                 pre["base_weights"], pre["dd_weights"], bt_data, rf, rb, a_starts)
+            # Compute any targets not in the precomputed file
+            missing = [t for t in _BASE_TARGETS if t not in base_results]
+            if missing:
+                for tgt in missing:
+                    w = run_optimization(
+                        opt_data, tgt, min_w_default, max_w_default, default_group_max,
+                        rf, rebalance="daily",
+                        leverage=cfd_leverage_opt, financing_rate=cfd_financing_opt,
+                    )
+                    s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
+                    base_results[tgt] = {"weights": w, "stats": s}
             with open(_cache_file, "wb") as f:
                 pickle.dump((base_results, dd_results), f)
             return base_results, dd_results
@@ -416,8 +446,22 @@ def _load_or_compute(opt_data, bt_data, rf, rb,
         base_w, dd_w = opt_weights
         base_results, dd_results = _stats_from_weights(
             base_w, dd_w, bt_data, rf, rb, a_starts)
+        # Compute any targets not in the cached weights
+        missing = [t for t in _BASE_TARGETS if t not in base_results]
+        if missing:
+            for tgt in missing:
+                w = run_optimization(
+                    opt_data, tgt, min_w_default, max_w_default, default_group_max,
+                    rf, rebalance="daily",
+                    leverage=cfd_leverage_opt, financing_rate=cfd_financing_opt,
+                )
+                s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
+                base_results[tgt] = {"weights": w, "stats": s}
     else:
-        base_results, dd_results = _compute_all(opt_data, bt_data, rf, rb, a_starts)
+        base_results, dd_results = _compute_all(
+            opt_data, bt_data, rf, rb, a_starts,
+            leverage=cfd_leverage_opt, financing_rate=cfd_financing_opt,
+        )
         # Cache weights separately
         base_w = {t: d["weights"] for t, d in base_results.items()}
         dd_w = {
@@ -702,6 +746,97 @@ if _macro_data is not None and "base_results" in st.session_state:
         "weights_schedule": _regime_schedule,
         "strategy_type": "regime",
     }
+
+# --- Drawdown Budget Allocation ---
+from dd_budget import build_dd_budget_schedule, dd_budget_analytics
+
+_budget_base_w = st.session_state.base_results.get(
+    "Max Sharpe Ratio", list(st.session_state.base_results.values())[0]
+)["weights"]
+_rebal_for_budget = rebalance if rebalance != "daily" else "monthly"
+_budget_schedule = build_dd_budget_schedule(
+    _budget_base_w, returns, tv_dd_constraint_val,
+    risk_free_rate, _rebal_for_budget, bt_asset_starts,
+)
+_budget_schedule = _enforce_schedule_dd(
+    _budget_schedule, returns, _budget_base_w, tv_dd_constraint_val,
+    risk_free_rate, _rebal_for_budget, bt_asset_starts,
+)
+_budget_stats = calc_stats(
+    returns, _budget_base_w, risk_free_rate,
+    rebalance=_rebal_for_budget, asset_starts=bt_asset_starts,
+    weights_schedule=_budget_schedule,
+)
+_budget_repr_w = _budget_schedule[max(_budget_schedule.keys())] if _budget_schedule else _budget_base_w
+st.session_state.portfolios["DD Budget (time-varying)"] = {
+    "weights": _budget_repr_w,
+    "stats": _budget_stats,
+    "weights_schedule": _budget_schedule,
+    "strategy_type": "dd_budget",
+}
+st.session_state._budget_schedule = _budget_schedule
+
+# --- Ensemble Meta-Strategy ---
+from ensemble import build_ensemble_schedule, ensemble_analytics
+
+_ensemble_constituents = {}
+for pname, pdata in st.session_state.portfolios.items():
+    if "weights_schedule" not in pdata:  # static strategies only
+        _ensemble_constituents[pname] = pdata["weights"]
+
+if len(_ensemble_constituents) >= 2:
+    _rebal_for_ensemble = rebalance if rebalance != "daily" else "quarterly"
+    _ensemble_schedule = build_ensemble_schedule(
+        _ensemble_constituents, returns, risk_free_rate,
+        rebalance=_rebal_for_ensemble, asset_starts=bt_asset_starts,
+    )
+    _ensemble_schedule = _enforce_schedule_dd(
+        _ensemble_schedule, returns,
+        np.mean(list(_ensemble_constituents.values()), axis=0),
+        tv_dd_constraint_val, risk_free_rate, _rebal_for_ensemble, bt_asset_starts,
+    )
+    _ensemble_repr_w = _ensemble_schedule[max(_ensemble_schedule.keys())] if _ensemble_schedule else np.mean(list(_ensemble_constituents.values()), axis=0)
+    _ensemble_stats = calc_stats(
+        returns, _ensemble_repr_w, risk_free_rate,
+        rebalance=_rebal_for_ensemble, asset_starts=bt_asset_starts,
+        weights_schedule=_ensemble_schedule,
+    )
+    st.session_state.portfolios["Ensemble (time-varying)"] = {
+        "weights": _ensemble_repr_w,
+        "stats": _ensemble_stats,
+        "weights_schedule": _ensemble_schedule,
+        "strategy_type": "ensemble",
+    }
+    st.session_state._ensemble_schedule = _ensemble_schedule
+    st.session_state._ensemble_constituents = _ensemble_constituents
+
+# --- Yield Curve Signal Overlay ---
+if _macro_data is not None and "base_results" in st.session_state:
+    from yield_signal import build_yield_signal_schedule, yield_signal_analytics
+
+    _yc_base_w = _budget_base_w  # same Max Sharpe base
+    _rebal_for_yc = rebalance if rebalance != "daily" else "monthly"
+    _yc_schedule = build_yield_signal_schedule(
+        _yc_base_w, _macro_data, returns,
+        rebalance=_rebal_for_yc,
+    )
+    _yc_schedule = _enforce_schedule_dd(
+        _yc_schedule, returns, _yc_base_w, tv_dd_constraint_val,
+        risk_free_rate, _rebal_for_yc, bt_asset_starts,
+    )
+    _yc_repr_w = _yc_schedule[max(_yc_schedule.keys())] if _yc_schedule else _yc_base_w
+    _yc_stats = calc_stats(
+        returns, _yc_base_w, risk_free_rate,
+        rebalance=_rebal_for_yc, asset_starts=bt_asset_starts,
+        weights_schedule=_yc_schedule,
+    )
+    st.session_state.portfolios["Yield Curve Signal (time-varying)"] = {
+        "weights": _yc_repr_w,
+        "stats": _yc_stats,
+        "weights_schedule": _yc_schedule,
+        "strategy_type": "yield_signal",
+    }
+    st.session_state._yc_schedule = _yc_schedule
 
 portfolio_names = list(st.session_state.portfolios.keys())
 
@@ -1404,6 +1539,131 @@ with tab_dynamic:
     else:
         st.info("DD Momentum data not available — ensure base portfolios are computed.")
 
+    # ── Section C: Drawdown Budget Allocation ──
+    st.markdown("---")
+    st.subheader("Drawdown Budget Allocation")
+    st.caption("Dynamically scales exposure based on remaining drawdown headroom. "
+               f"Budget = {tv_dd_constraint_pct}% (from sidebar). At peak = full allocation; as DD deepens, scales toward cash.")
+
+    if "_budget_schedule" in st.session_state and st.session_state._budget_schedule:
+        _ba = dd_budget_analytics(returns, _budget_base_w, tv_dd_constraint_val, st.session_state._budget_schedule)
+        if _ba["dates"]:
+            fig_budget = go.Figure()
+            fig_budget.add_trace(go.Scatter(
+                x=_ba["dates"], y=[sf * 100 for sf in _ba["scale_factors"]],
+                mode="lines", name="Exposure (%)", line=dict(color="#FF6D00", width=2),
+            ))
+            fig_budget.update_layout(
+                yaxis_title="Exposure (%)", xaxis_title="Date",
+                yaxis=dict(range=[0, 105]),
+                template="plotly_white", height=250,
+            )
+            st.plotly_chart(fig_budget, width="stretch")
+
+            # Equity curve comparison
+            if "DD Budget (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
+                st.caption("DD Budget vs Max Sharpe (Static)")
+                eq_budget = compute_equity_curve(returns, _budget_base_w,
+                                                  rebalance=_rebal_for_budget, asset_starts=bt_asset_starts,
+                                                  weights_schedule=st.session_state._budget_schedule)
+                _ms_w_b = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
+                eq_sharpe_b = compute_equity_curve(returns, _ms_w_b,
+                                                    rebalance=rebalance, asset_starts=bt_asset_starts)
+                fig_bv = go.Figure()
+                fig_bv.add_trace(go.Scatter(x=eq_budget.index, y=eq_budget.values, name="DD Budget (time-varying)", line=dict(color="#FF6D00")))
+                fig_bv.add_trace(go.Scatter(x=eq_sharpe_b.index, y=eq_sharpe_b.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+                fig_bv.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
+                                     template="plotly_white", height=350, hovermode="x unified")
+                st.plotly_chart(fig_bv, width="stretch")
+    else:
+        st.info("DD Budget data not available.")
+
+    # ── Section D: Ensemble Meta-Strategy ──
+    st.markdown("---")
+    st.subheader("Ensemble Meta-Strategy")
+    st.caption("Blends static strategies weighted by trailing 12-month inverse-volatility. "
+               "Diversifies across methodologies, not just assets.")
+
+    if "_ensemble_constituents" in st.session_state and "_ensemble_schedule" in st.session_state:
+        _ea = ensemble_analytics(st.session_state._ensemble_constituents, returns, risk_free_rate)
+        _ea_df = pd.DataFrame({
+            "Strategy": _ea["strategy_names"],
+            "Allocation": _ea["allocations"],
+            "Trailing Vol": _ea["trailing_vols"],
+            "Trailing Sharpe": _ea["trailing_sharpes"],
+        })
+        st.dataframe(
+            _ea_df,
+            column_config={
+                "Strategy": st.column_config.TextColumn("Strategy"),
+                "Allocation": st.column_config.NumberColumn("Allocation", format="%.1f%%"),
+                "Trailing Vol": st.column_config.NumberColumn("Trailing Vol", format="%.2f%%"),
+                "Trailing Sharpe": st.column_config.NumberColumn("Trailing Sharpe", format="%.2f"),
+            },
+            width="stretch", hide_index=True,
+        )
+
+        # Equity curve comparison
+        if "Ensemble (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
+            st.caption("Ensemble vs Max Sharpe (Static)")
+            _ens_repr = st.session_state.portfolios["Ensemble (time-varying)"]["weights"]
+            eq_ens = compute_equity_curve(returns, _ens_repr,
+                                          rebalance=_rebal_for_ensemble, asset_starts=bt_asset_starts,
+                                          weights_schedule=st.session_state._ensemble_schedule)
+            _ms_w_e = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
+            eq_sharpe_e = compute_equity_curve(returns, _ms_w_e,
+                                               rebalance=rebalance, asset_starts=bt_asset_starts)
+            fig_ev = go.Figure()
+            fig_ev.add_trace(go.Scatter(x=eq_ens.index, y=eq_ens.values, name="Ensemble (time-varying)", line=dict(color="#AB47BC")))
+            fig_ev.add_trace(go.Scatter(x=eq_sharpe_e.index, y=eq_sharpe_e.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+            fig_ev.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
+                                 template="plotly_white", height=350, hovermode="x unified")
+            st.plotly_chart(fig_ev, width="stretch")
+    else:
+        st.info("Ensemble strategy requires at least 2 static strategies.")
+
+    # ── Section E: Yield Curve Signal Overlay ──
+    st.markdown("---")
+    st.subheader("Yield Curve Signal Overlay")
+    st.caption("Tilts defensive when the Fed Funds rate is rising >200 bp/yr. "
+               "Uses 12-month rolling change in Fed Funds as signal.")
+
+    if "_yc_schedule" in st.session_state and st.session_state._yc_schedule:
+        _ya = yield_signal_analytics(_macro_data)
+        if _ya["dates"]:
+            fig_yc = go.Figure()
+            colors = ["rgba(255,23,68,0.3)" if s else "rgba(0,200,83,0.3)" for s in _ya["signals"]]
+            fig_yc.add_trace(go.Bar(
+                x=_ya["dates"], y=_ya["ff_changes"],
+                marker_color=colors, name="FF 12m Change (pp)",
+            ))
+            fig_yc.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="200bp threshold")
+            fig_yc.update_layout(
+                yaxis_title="Fed Funds 12m Change (pp)", xaxis_title="Date",
+                template="plotly_white", height=250,
+            )
+            st.plotly_chart(fig_yc, width="stretch")
+
+            # Equity curve comparison
+            if "Yield Curve Signal (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
+                st.caption("Yield Curve Signal vs Max Sharpe (Static)")
+                eq_yc = compute_equity_curve(returns, _yc_base_w,
+                                              rebalance=_rebal_for_yc, asset_starts=bt_asset_starts,
+                                              weights_schedule=st.session_state._yc_schedule)
+                _ms_w_y = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
+                eq_sharpe_y = compute_equity_curve(returns, _ms_w_y,
+                                                    rebalance=rebalance, asset_starts=bt_asset_starts)
+                fig_ycv = go.Figure()
+                fig_ycv.add_trace(go.Scatter(x=eq_yc.index, y=eq_yc.values, name="Yield Curve Signal (time-varying)", line=dict(color="#26A69A")))
+                fig_ycv.add_trace(go.Scatter(x=eq_sharpe_y.index, y=eq_sharpe_y.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
+                fig_ycv.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
+                                       template="plotly_white", height=350, hovermode="x unified")
+                st.plotly_chart(fig_ycv, width="stretch")
+    elif _macro_data is None:
+        st.info("Yield Curve Signal requires macro data (Inflation and IR.xlsx).")
+    else:
+        st.info("Yield Curve Signal data not available.")
+
 # ======================================================================
 # TAB 3: CFD ANALYSIS
 # ======================================================================
@@ -1815,6 +2075,25 @@ with tab_guide:
             "**Hierarchical Risk Parity** clusters correlated assets and allocates top-down for robustness."
         )
 
+    # ── Leverage-Aware Strategies ──
+    with st.expander("Leverage-Aware Strategies"):
+        st.markdown(
+            "**Leverage-Optimal** maximises post-leverage, post-financing Sharpe ratio directly. "
+            "The objective accounts for volatility drag (L(L−1)σ²/2) and financing costs, "
+            "finding the unleveraged allocation that compounds best when leveraged. "
+            "Tends to favour low-vol assets because vol drag scales quadratically with leverage."
+        )
+        st.markdown(
+            "**Carry-Adjusted Risk Parity** modifies Equal Risk Contribution by accounting "
+            "for CFD financing costs. Each asset's net carry = historical CAGR − financing rate. "
+            "Assets with positive carry receive higher weights; those with negative carry are underweighted."
+        )
+        st.markdown(
+            "**Adaptive Lookback Blend** runs Max Sharpe optimisation over four trailing windows "
+            "(63, 126, 252, 504 days) and equal-weight blends the results. "
+            "Smooths allocations across time horizons, reducing sensitivity to lookback choice."
+        )
+
     # ── Drawdown-Constrained ──
     with st.expander("Drawdown-Constrained Strategies"):
         st.markdown(
@@ -1833,6 +2112,23 @@ with tab_guide:
             "**DD P-Value Momentum** ranks each asset's current drawdown against its own history. "
             "Assets with historically rare drawdowns (low p-value) receive allocation bumps. "
             "The bump schedule shape is optimised via grid search to maximise CAGR."
+        )
+        st.markdown(
+            "**DD Budget Allocation** tracks the portfolio's running drawdown from peak and "
+            "scales exposure proportional to remaining headroom: scale = (budget − |DD|) / budget. "
+            "At peak equity, full allocation. As DD deepens, progressively shifts to cash. "
+            "Creates synthetic downside protection without options."
+        )
+        st.markdown(
+            "**Ensemble Meta-Strategy** treats static strategies as sub-portfolios and "
+            "allocates across them using trailing 12-month inverse-volatility weighting. "
+            "Diversifies across *methodologies*, producing smoother performance by "
+            "always partially allocated to whichever approach is currently working."
+        )
+        st.markdown(
+            "**Yield Curve Signal Overlay** monitors the 12-month change in the Fed Funds rate. "
+            "When rates rise above 200bp/yr (indicating tightening), tilts toward defensive assets "
+            "(short-term treasuries, gold, cash). When stable or falling, runs the full base allocation."
         )
 
     # ── Benchmark ──

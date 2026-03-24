@@ -93,12 +93,15 @@ def _objective(
     dd_constraint: float | None = None,
     dd_returns: pd.DataFrame | None = None,
     dd_asset_starts: dict | None = None,
+    leverage: float = 1.0,
+    financing_rate: float = 0.065,
 ) -> float:
     """Objective function for optimization (negated for minimization).
 
     When dd_constraint is set, a heavy penalty is added if drawdown exceeds the limit.
     dd_returns / dd_asset_starts: if provided, evaluate the DD penalty on this
     (potentially longer) backtest period instead of the optimisation returns.
+    leverage / financing_rate: used by the Leverage-Optimal target.
     """
     s = calc_stats(returns, w, risk_free_rate, rebalance=rebalance)
 
@@ -128,6 +131,17 @@ def _objective(
                               asset_starts=dd_asset_starts)
             return abs(s_dd.max_drawdown) + s_dd.longest_dd * 5e-5
         return abs(s.max_drawdown) + s.longest_dd * 5e-5
+    elif target == "Leverage-Optimal":
+        L = leverage
+        vol = s.volatility
+        # Post-leverage CAGR: leveraged growth minus vol drag minus financing
+        post_lev_cagr = s.cagr * L - 0.5 * vol**2 * L * (L - 1) - financing_rate * (L - 1)
+        post_lev_vol = vol * L
+        if post_lev_vol > 1e-4:
+            post_lev_sharpe = (post_lev_cagr - risk_free_rate) / post_lev_vol
+        else:
+            post_lev_sharpe = 0.0
+        return -post_lev_sharpe + dd_penalty
     return -s.sharpe + dd_penalty
 
 
@@ -143,8 +157,10 @@ def optimize_portfolio(
     dd_constraint: float | None = None,
     dd_returns: pd.DataFrame | None = None,
     dd_asset_starts: dict | None = None,
+    leverage: float = 1.0,
+    financing_rate: float = 0.065,
 ) -> np.ndarray:
-    """Run constrained optimization for Sharpe/Volatility/Calmar/Drawdown targets."""
+    """Run constrained optimization for Sharpe/Volatility/Calmar/Drawdown/Leverage targets."""
     n = len(ASSETS)
     groups = _group_indices()
 
@@ -161,7 +177,8 @@ def optimize_portfolio(
 
     def obj(w):
         return _objective(w, returns, target, risk_free_rate, rebalance,
-                          dd_constraint, dd_returns, dd_asset_starts)
+                          dd_constraint, dd_returns, dd_asset_starts,
+                          leverage, financing_rate)
 
     # For drawdown minimisation, use penalty-based objective with
     # differential_evolution (gradient-free global optimizer) since
@@ -225,7 +242,8 @@ def _build_starts(returns, min_w, max_w, group_max, current_weights, target):
     starts.append(np.full(n, 1.0 / n))
 
     # For drawdown-focused targets, add low-vol biased starts
-    if target in ("Minimize Max Drawdown", "Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)"):
+    if target in ("Minimize Max Drawdown", "Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)",
+                  "Leverage-Optimal"):
         low_vol = iv.copy()
         low_vol **= 2
         low_vol /= low_vol.sum()
@@ -512,6 +530,81 @@ def hierarchical_risk_parity(
     return clip_normalize(w, min_w, max_w, group_max)
 
 
+def carry_adjusted_risk_parity(
+    returns: pd.DataFrame,
+    min_w: np.ndarray,
+    max_w: np.ndarray,
+    group_max: dict[str, float],
+    financing_rate: float = 0.07,
+    leverage: float = 3.0,
+) -> np.ndarray:
+    """Equal Risk Contribution adjusted for CFD financing costs.
+
+    Assets with positive net carry (CAGR > financing cost) receive higher
+    weights; those with negative carry are underweighted.
+    """
+    # Base ERC weights
+    erc_w = equal_risk_contribution(returns, min_w, max_w, group_max)
+
+    # Per-asset annualised CAGR from daily log returns
+    n_days = len(returns)
+    total_calendar = (returns.index[-1] - returns.index[0]).days
+    asset_cagrs = np.zeros(len(ASSETS))
+    for i, a in enumerate(ASSETS):
+        cum_log = returns[a].sum()
+        if total_calendar > 0:
+            asset_cagrs[i] = np.exp(cum_log * 365.0 / total_calendar) - 1.0
+
+    # Net carry = asset return minus financing cost per unit leverage
+    net_carry = asset_cagrs - financing_rate
+
+    # Softmax-style carry score: exp(net_carry * scaling_factor)
+    carry_score = np.exp(net_carry * 5.0)
+    carry_score = np.maximum(carry_score, 0.1)  # floor to avoid zeroing out
+
+    adjusted = erc_w * carry_score
+    adjusted = np.maximum(adjusted, 0.0)
+    total = adjusted.sum()
+    if total > 1e-12:
+        adjusted /= total
+
+    return clip_normalize(adjusted, min_w, max_w, group_max)
+
+
+def adaptive_lookback_blend(
+    returns: pd.DataFrame,
+    min_w: np.ndarray,
+    max_w: np.ndarray,
+    group_max: dict[str, float],
+    risk_free_rate: float = 0.04,
+    windows: list[int] | None = None,
+) -> np.ndarray:
+    """Blend Max Sharpe weights optimised across multiple trailing windows.
+
+    Produces smoother allocations that adapt across time horizons, reducing
+    sensitivity to the choice of lookback period.
+    """
+    if windows is None:
+        windows = [63, 126, 252, 504]
+
+    n = len(ASSETS)
+    all_weights = []
+
+    for w_len in windows:
+        subset = returns.iloc[-w_len:] if len(returns) >= w_len else returns
+        if len(subset) < 30:
+            # Too few observations — use equal weight as fallback
+            all_weights.append(np.full(n, 1.0 / n))
+            continue
+        w = optimize_portfolio(subset, "Max Sharpe Ratio", min_w, max_w,
+                               group_max, risk_free_rate)
+        all_weights.append(w)
+
+    # Equal-weight blend of all window results
+    blended = np.mean(all_weights, axis=0)
+    return clip_normalize(blended, min_w, max_w, group_max)
+
+
 def run_optimization(
     returns: pd.DataFrame,
     target: str,
@@ -524,6 +617,8 @@ def run_optimization(
     dd_constraint: float | None = None,
     dd_returns: pd.DataFrame | None = None,
     dd_asset_starts: dict | None = None,
+    leverage: float = 1.0,
+    financing_rate: float = 0.065,
 ) -> np.ndarray:
     """Dispatch to the appropriate optimization strategy."""
     if target == "Inverse Volatility":
@@ -532,9 +627,17 @@ def run_optimization(
         return equal_risk_contribution(returns, min_w, max_w, group_max)
     elif target == "Hierarchical Risk Parity":
         return hierarchical_risk_parity(returns, min_w, max_w, group_max)
+    elif target == "Carry-Adjusted Risk Parity":
+        return carry_adjusted_risk_parity(
+            returns, min_w, max_w, group_max, financing_rate, leverage,
+        )
+    elif target == "Adaptive Lookback Blend":
+        return adaptive_lookback_blend(
+            returns, min_w, max_w, group_max, risk_free_rate,
+        )
     else:
         return optimize_portfolio(
             returns, target, min_w, max_w, group_max,
             risk_free_rate, current_weights, rebalance, dd_constraint,
-            dd_returns, dd_asset_starts,
+            dd_returns, dd_asset_starts, leverage, financing_rate,
         )
