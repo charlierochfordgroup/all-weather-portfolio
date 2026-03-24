@@ -157,6 +157,10 @@ def _periodic_rebal_returns(
         else:
             cur_w = target_w.copy()
 
+        # Track whether this schedule uses sub-1.0 weights (cash allocation)
+        _target_sum = target_w.sum()
+        _has_cash = _target_sum < 1.0 - 1e-8
+
         for t in range(seg_start, seg_end):
             sr = simple_rets[t]
             day_r = cur_w @ sr
@@ -166,7 +170,13 @@ def _periodic_rebal_returns(
             grown = cur_w * (1.0 + sr)
             total = grown.sum()
             if total > 1e-12:
-                cur_w = grown / total
+                if _has_cash:
+                    # Preserve cash allocation: normalise risky weights
+                    # back to their original total (target_sum), keeping
+                    # the remainder as implicit cash.
+                    cur_w = grown * (_target_sum / total)
+                else:
+                    cur_w = grown / total
             else:
                 if has_eff and not has_schedule:
                     cur_w = eff_weights[t].copy()

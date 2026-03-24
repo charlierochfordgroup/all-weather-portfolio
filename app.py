@@ -121,6 +121,16 @@ dd_constraint_pct = st.sidebar.selectbox(
     key="dd_constraint_select",
 )
 dd_constraint_val = dd_constraint_pct / 100.0
+_TV_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 50]
+tv_dd_constraint_pct = st.sidebar.selectbox(
+    "Max DD \u2013 Time-Varying (%)",
+    _TV_DD_LEVELS,
+    index=_TV_DD_LEVELS.index(20),
+    key="tv_dd_constraint_select",
+    help="Separate drawdown cap for Regime-Based and DD P-Value Momentum strategies. "
+         "Enforced as a hard constraint on the full backtest equity curve.",
+)
+tv_dd_constraint_val = tv_dd_constraint_pct / 100.0
 exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=False)
 
 # Base strategies (always computed once)
@@ -316,6 +326,53 @@ def _stats_from_weights(base_w, dd_w, bt_data, rf, rb, a_starts):
             s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
             dd_results[dd_pct][tgt] = {"weights": w, "stats": s}
     return base_results, dd_results
+
+
+def _enforce_schedule_dd(
+    schedule: dict,
+    returns: pd.DataFrame,
+    base_weights,
+    dd_limit: float,
+    risk_free_rate: float,
+    rebalance: str,
+    asset_starts: dict | None = None,
+) -> dict:
+    """Hard-enforce a max-drawdown cap on a time-varying weight schedule.
+
+    If the full-backtest max drawdown exceeds *dd_limit*, scale down every
+    checkpoint's weights toward cash (zeros) via binary search until the
+    constraint is satisfied.  The unallocated portion (1 – sum(weights))
+    implicitly earns 0 % – i.e. cash.
+    """
+    if not schedule:
+        return schedule
+
+    s = calc_stats(
+        returns, base_weights, risk_free_rate,
+        rebalance=rebalance, asset_starts=asset_starts,
+        weights_schedule=schedule,
+    )
+    if abs(s.max_drawdown) <= dd_limit:
+        return schedule  # already within limit
+
+    # Binary-search a scalar scale factor: 0 = 100 % cash, 1 = original weights
+    lo, hi = 0.0, 1.0
+    for _ in range(30):
+        mid = (lo + hi) / 2.0
+        blended = {dt: w * mid for dt, w in schedule.items()}
+        s2 = calc_stats(
+            returns, base_weights * mid, risk_free_rate,
+            rebalance=rebalance, asset_starts=asset_starts,
+            weights_schedule=blended,
+        )
+        if abs(s2.max_drawdown) > dd_limit:
+            hi = mid
+        else:
+            lo = mid
+
+    # Use conservative (lower) factor
+    final = {dt: w * lo for dt, w in schedule.items()}
+    return final
 
 
 def _load_or_compute(opt_data, bt_data, rf, rb,
@@ -518,11 +575,16 @@ if "base_results" in st.session_state and "Max Sharpe Ratio" in st.session_state
     _rebal_for_dynamic = rebalance if rebalance != "daily" else "annual"
     _dd_schedule = build_dd_momentum_schedule(
         _ms_weights, _dd_adj,
-        dd_constraint=dd_constraint_val,
+        dd_constraint=tv_dd_constraint_val,
         returns=returns,
         risk_free_rate=risk_free_rate,
         rebalance=_rebal_for_dynamic,
         asset_starts=bt_asset_starts,
+    )
+    # Hard-enforce the time-varying DD cap on the full backtest
+    _dd_schedule = _enforce_schedule_dd(
+        _dd_schedule, returns, _ms_weights, tv_dd_constraint_val,
+        risk_free_rate, _rebal_for_dynamic, bt_asset_starts,
     )
 
     _dd_stats = calc_stats(
@@ -550,7 +612,7 @@ if _macro_data is not None and "base_results" in st.session_state:
     st.session_state._regime_series = _regime_series
 
     # Only optimise regimes if we haven't cached them for this config
-    _regime_base_key = _cache_key(f"regime_{overlap_start_date}_{dd_constraint_pct}", end_date, risk_free_rate, "daily")
+    _regime_base_key = _cache_key(f"regime_{overlap_start_date}_{tv_dd_constraint_pct}", end_date, risk_free_rate, "daily")
     _regime_cache_key = f"{_regime_base_key}_btc={exclude_bitcoin}"
 
     if st.session_state.get("_regime_cache_key") != _regime_cache_key:
@@ -582,7 +644,7 @@ if _macro_data is not None and "base_results" in st.session_state:
                             opt_returns, _regime_series, "Max Sharpe Ratio",
                             min_w_default, max_w_default, default_group_max,
                             risk_free_rate, rebalance="daily",
-                            dd_constraint=dd_constraint_val,
+                            dd_constraint=tv_dd_constraint_val,
                             dd_returns=returns, dd_asset_starts=bt_asset_starts,
                         )
         else:
@@ -593,8 +655,8 @@ if _macro_data is not None and "base_results" in st.session_state:
                     with open(PRECOMPUTED_FILE, "rb") as f:
                         _pre = pickle.load(f)
                     _pre_rw_by_dd = _pre.get("regime_weights_by_dd", {})
-                    if dd_constraint_pct in _pre_rw_by_dd:
-                        _regime_weights = _pre_rw_by_dd[dd_constraint_pct]
+                    if tv_dd_constraint_pct in _pre_rw_by_dd:
+                        _regime_weights = _pre_rw_by_dd[tv_dd_constraint_pct]
                     elif _pre.get("regime_weights") is not None:
                         _regime_weights = _pre["regime_weights"]
                 except Exception:
@@ -607,7 +669,7 @@ if _macro_data is not None and "base_results" in st.session_state:
                             opt_returns, _regime_series, "Max Sharpe Ratio",
                             min_w_default, max_w_default, default_group_max,
                             risk_free_rate, rebalance="daily",
-                            dd_constraint=dd_constraint_val,
+                            dd_constraint=tv_dd_constraint_val,
                             dd_returns=returns, dd_asset_starts=bt_asset_starts,
                         )
         st.session_state._regime_weights = _regime_weights
@@ -618,6 +680,12 @@ if _macro_data is not None and "base_results" in st.session_state:
     _rebal_for_regime = rebalance if rebalance != "daily" else "annual"
     _regime_schedule = build_regime_schedule(
         returns.index, _regime_series, _regime_weights, _rebal_for_regime,
+    )
+    # Hard-enforce the time-varying DD cap on the full backtest
+    _regime_repr_w_pre = np.mean(list(_regime_weights.values()), axis=0)
+    _regime_schedule = _enforce_schedule_dd(
+        _regime_schedule, returns, _regime_repr_w_pre, tv_dd_constraint_val,
+        risk_free_rate, _rebal_for_regime, bt_asset_starts,
     )
     st.session_state._regime_schedule = _regime_schedule
 
@@ -815,10 +883,8 @@ with tab_compare:
         for pname, pdata in st.session_state.portfolios.items():
             comp_rows.append({"Strategy": pname, **_stats_row_numeric(pdata["stats"])})
         comp_df = pd.DataFrame(comp_rows)
-        # Apply conditional colour-coding to Current DD column
-        comp_styled = comp_df.style.applymap(_style_current_dd, subset=["Current DD"])
         st.dataframe(
-            comp_styled,
+            comp_df,
             column_config={"Strategy": st.column_config.TextColumn("Strategy"), **_STATS_COL_CONFIG},
             width="stretch",
             hide_index=True,
@@ -1081,7 +1147,7 @@ with tab_compare:
 with tab_dynamic:
     st.header("Dynamic Strategies")
     st.caption(f"Strategies that adjust allocations over time based on market conditions. "
-               f"Max drawdown constraint ({dd_constraint_pct}%) applied to both strategies via sidebar.")
+               f"Max drawdown constraint ({tv_dd_constraint_pct}%) applied via sidebar (hard-enforced on full backtest).")
 
     # ── Section A: Regime-Based Allocation ──
     st.subheader("Regime-Based Allocation")
@@ -1161,9 +1227,7 @@ with tab_dynamic:
             with stat_cols[i]:
                 count = _analytics["regime_counts"].get(label_id, 0)
                 avg_m = _analytics["regime_avg_months"].get(label_id, 0)
-                st.markdown(f"**{label_name}**")
-                st.markdown(f"{count} periods")
-                st.caption(f"Avg {avg_m:.0f} months")
+                st.markdown(f"**{label_name}**  \n{count} periods · avg {avg_m:.0f} months")
 
         # Weights per regime table (transposed: assets as rows, regimes as columns)
         st.caption("Optimal Weights per Regime")

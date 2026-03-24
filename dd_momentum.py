@@ -244,7 +244,7 @@ def build_dd_momentum_schedule(
         schedule[date] = adjusted
 
         # Enforce DD constraint: if the schedule so far exceeds the limit,
-        # scale back this checkpoint's adjustments via binary search.
+        # scale back this checkpoint's weights toward cash via binary search.
         if dd_constraint is not None and returns is not None:
             s = calc_stats(
                 returns, base_weights, risk_free_rate,
@@ -252,16 +252,13 @@ def build_dd_momentum_schedule(
                 weights_schedule=schedule,
             )
             if abs(s.max_drawdown) > dd_constraint:
+                orig_w = adjusted.copy()
                 lo, hi = 0.0, 1.0
-                for _ in range(10):
+                for _ in range(15):
                     mid = (lo + hi) / 2.0
-                    scaled = base_weights * (1.0 + adj * mid)
-                    scaled = np.maximum(scaled, 0.0)
-                    t = scaled.sum()
-                    scaled = scaled / t if t > 1e-12 else base_weights.copy()
-                    schedule[date] = scaled
+                    schedule[date] = orig_w * mid
                     s2 = calc_stats(
-                        returns, base_weights, risk_free_rate,
+                        returns, base_weights * mid, risk_free_rate,
                         rebalance=rebalance, asset_starts=asset_starts,
                         weights_schedule=schedule,
                     )
@@ -269,11 +266,7 @@ def build_dd_momentum_schedule(
                         hi = mid
                     else:
                         lo = mid
-                # Use the conservative (lower) scaling factor
-                final_scaled = base_weights * (1.0 + adj * lo)
-                final_scaled = np.maximum(final_scaled, 0.0)
-                t = final_scaled.sum()
-                schedule[date] = final_scaled / t if t > 1e-12 else base_weights.copy()
+                schedule[date] = orig_w * lo
 
     return schedule
 
