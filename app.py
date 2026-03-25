@@ -419,8 +419,14 @@ def _load_or_compute(opt_data, bt_data, rf, rb,
         try:
             with open(PRECOMPUTED_FILE, "rb") as f:
                 pre = pickle.load(f)
+            # Use BTC-specific variant if available
+            btc_key = "excl_btc" if exclude_bitcoin else "incl_btc"
+            if "btc_variants" in pre and btc_key in pre["btc_variants"]:
+                variant = pre["btc_variants"][btc_key]
+            else:
+                variant = pre  # backward compat: old format has no btc_variants
             base_results, dd_results = _stats_from_weights(
-                pre["base_weights"], pre["dd_weights"], bt_data, rf, rb, a_starts)
+                variant["base_weights"], variant["dd_weights"], bt_data, rf, rb, a_starts)
             # Compute any targets not in the precomputed file
             missing = [t for t in _BASE_TARGETS if t not in base_results]
             if missing:
@@ -545,15 +551,14 @@ if st.session_state.get("defaults_cache_key") != cache_key:
         with open(cache_file, "wb") as f:
             pickle.dump((base_results, dd_results), f)
     else:
-        with st.sidebar:
-            with st.spinner("Computing portfolios..."):
-                base_results, dd_results = _load_or_compute(
-                    opt_returns, returns, risk_free_rate, rebalance,
-                    cache_file, opt_cache_file, bt_asset_starts,
-                )
-                st.session_state.base_results = base_results
-                st.session_state.dd_results = dd_results
-                st.session_state.defaults_cache_key = cache_key
+        with st.spinner("⏳ Computing portfolios — this may take a couple of minutes on first run..."):
+            base_results, dd_results = _load_or_compute(
+                opt_returns, returns, risk_free_rate, rebalance,
+                cache_file, opt_cache_file, bt_asset_starts,
+            )
+            st.session_state.base_results = base_results
+            st.session_state.dd_results = dd_results
+            st.session_state.defaults_cache_key = cache_key
 
     st.session_state._prev_exclude_btc = exclude_bitcoin
 
@@ -608,7 +613,11 @@ if "base_results" in st.session_state and "Max Sharpe Ratio" in st.session_state
             try:
                 with open(PRECOMPUTED_FILE, "rb") as f:
                     _pre_dd = pickle.load(f)
-                _dd_adj = _pre_dd.get("dd_momentum_adjustments")
+                _btc_key = "excl_btc" if exclude_bitcoin else "incl_btc"
+                if "btc_variants" in _pre_dd and _btc_key in _pre_dd["btc_variants"]:
+                    _dd_adj = _pre_dd["btc_variants"][_btc_key].get("dd_momentum_adjustments")
+                else:
+                    _dd_adj = _pre_dd.get("dd_momentum_adjustments")
             except Exception:
                 pass
         if _dd_adj is None:
@@ -702,11 +711,16 @@ if _macro_data is not None and "base_results" in st.session_state:
                 try:
                     with open(PRECOMPUTED_FILE, "rb") as f:
                         _pre = pickle.load(f)
-                    _pre_rw_by_dd = _pre.get("regime_weights_by_dd", {})
+                    _btc_key = "excl_btc" if exclude_bitcoin else "incl_btc"
+                    if "btc_variants" in _pre and _btc_key in _pre["btc_variants"]:
+                        _pre_variant = _pre["btc_variants"][_btc_key]
+                    else:
+                        _pre_variant = _pre
+                    _pre_rw_by_dd = _pre_variant.get("regime_weights_by_dd", {})
                     if tv_dd_constraint_pct in _pre_rw_by_dd:
                         _regime_weights = _pre_rw_by_dd[tv_dd_constraint_pct]
-                    elif _pre.get("regime_weights") is not None:
-                        _regime_weights = _pre["regime_weights"]
+                    elif _pre_variant.get("regime_weights") is not None:
+                        _regime_weights = _pre_variant["regime_weights"]
                 except Exception:
                     pass
 

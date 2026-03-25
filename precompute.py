@@ -68,112 +68,120 @@ def main():
     overlap_start = max(asset_starts.values())
     opt_returns = returns_full.loc[overlap_start:]
 
-    min_w = np.array([DEFAULT_MIN.get(a, 0.5) / 100.0 for a in ASSETS])
-    max_w = np.array([DEFAULT_MAX.get(a, 30.0) / 100.0 for a in ASSETS])
-    # Exclude Bitcoin by default (matches app.py default)
-    btc_idx = ASSETS.index("Bitcoin")
-    min_w[btc_idx] = 0.0
-    max_w[btc_idx] = 0.0
     group_max = {g: v / 100.0 for g, v in DEFAULT_GROUP_MAX.items()}
     rf = RISK_FREE_RATE
+    btc_idx = ASSETS.index("Bitcoin")
 
     # Full backtest returns for DD constraint evaluation
     bt_returns = returns_full
     bt_asset_starts = asset_starts
 
     print(f"Overlap period: {overlap_start.date()} to {returns_full.index[-1].date()}")
-    print(f"Optimising {len(BASE_TARGETS)} base + {len(DD_TARGETS)}x{len(DD_LEVELS)} DD-constrained portfolios...")
 
-    # Base strategies
-    base_w = {}
-    for i, tgt in enumerate(BASE_TARGETS, 1):
-        print(f"  [{i}/{len(BASE_TARGETS)}] {tgt}...")
-        w = run_optimization(opt_returns, tgt, min_w, max_w, group_max, rf, rebalance="daily",
-                             leverage=LEVERAGE, financing_rate=FINANCING_RATE)
-        base_w[tgt] = w
+    # ── Compute for both BTC variants ──
+    all_variants = {}
+    for btc_label, exclude_btc in [("excl_btc", True), ("incl_btc", False)]:
+        print(f"\n{'='*60}")
+        print(f"  Variant: {btc_label}")
+        print(f"{'='*60}")
 
-    # DD-constrained strategies (warm-started from previous level)
-    dd_w = {}
-    prev_w = {}
-    total_dd = len(DD_LEVELS) * len(DD_TARGETS)
-    count = 0
-    for dd_pct in sorted(DD_LEVELS):
-        dd_val = dd_pct / 100.0
-        dd_w[dd_pct] = {}
-        for tgt in DD_TARGETS:
-            count += 1
-            print(f"  [{count}/{total_dd}] {tgt.replace('X%', f'{dd_pct}%')}...")
-            w = run_optimization(
-                opt_returns, tgt, min_w, max_w, group_max, rf,
-                rebalance="daily", dd_constraint=dd_val,
-                current_weights=prev_w.get(tgt),
-                dd_returns=bt_returns, dd_asset_starts=bt_asset_starts,
-            )
-            dd_w[dd_pct][tgt] = w
-            prev_w[tgt] = w
+        min_w = np.array([DEFAULT_MIN.get(a, 0.5) / 100.0 for a in ASSETS])
+        max_w = np.array([DEFAULT_MAX.get(a, 30.0) / 100.0 for a in ASSETS])
+        if exclude_btc:
+            min_w[btc_idx] = 0.0
+            max_w[btc_idx] = 0.0
 
-    # ── Dynamic strategies ──
+        print(f"Optimising {len(BASE_TARGETS)} base + {len(DD_TARGETS)}x{len(DD_LEVELS)} DD-constrained portfolios...")
 
-    # DD Momentum: compute annual adjustments using Max Sharpe as base
-    print("\nComputing DD Momentum adjustments...")
-    ms_weights = base_w["Max Sharpe Ratio"]
-    years = sorted(set(returns_full.index.year))
-    checkpoints = []
-    for y in years:
-        yr_dates = returns_full.index[returns_full.index.year == y]
-        if len(yr_dates) > 0:
-            checkpoints.append(yr_dates[0])
-    # Use optimised per-rank bump schedule if available, otherwise parametric
-    optimal_sched = load_optimal_bump_schedule()
-    if optimal_sched is not None:
-        print("  Using optimised per-rank bump schedule")
-        dd_adj = compute_dd_adjustments_scheduled(returns_full, checkpoints, optimal_sched)
-    else:
-        print("  Using default parametric bump schedule (bump_max=50%)")
-        dd_adj = compute_dd_adjustments(returns_full, checkpoints)
-    dd_momentum_schedule = build_dd_momentum_schedule(ms_weights, dd_adj)
-    print(f"  {len(dd_adj)} annual checkpoints computed")
+        # Base strategies
+        base_w = {}
+        for i, tgt in enumerate(BASE_TARGETS, 1):
+            print(f"  [{i}/{len(BASE_TARGETS)}] {tgt}...")
+            w = run_optimization(opt_returns, tgt, min_w, max_w, group_max, rf, rebalance="daily",
+                                 leverage=LEVERAGE, financing_rate=FINANCING_RATE)
+            base_w[tgt] = w
 
-    # Regime: optimise per regime if macro data available
-    # Pre-compute for each DD constraint level so the app doesn't have to
-    macro_path = Path(__file__).resolve().parent / "Inflation and IR.xlsx"
-    macro_data = load_regime_data(macro_path)
-    regime_weights = None
-    regime_series = None
-    regime_weights_by_dd = {}
-    if macro_data is not None:
-        print("\nComputing regime portfolios...")
-        regime_series = classify_regimes(macro_data)
-        # Unconstrained (for backward compat)
-        regime_weights = optimize_per_regime(
-            opt_returns, regime_series, "Max Sharpe Ratio",
-            min_w, max_w, group_max, rf, rebalance="daily",
-        )
-        for label_id, w in regime_weights.items():
-            print(f"  Regime {label_id} (unconstrained): done")
-        # Per DD level
-        for dd_pct in DD_LEVELS:
+        # DD-constrained strategies (warm-started from previous level)
+        dd_w = {}
+        prev_w = {}
+        total_dd = len(DD_LEVELS) * len(DD_TARGETS)
+        count = 0
+        for dd_pct in sorted(DD_LEVELS):
             dd_val = dd_pct / 100.0
-            print(f"  Regime weights with DD≤{dd_pct}%...")
-            rw = optimize_per_regime(
+            dd_w[dd_pct] = {}
+            for tgt in DD_TARGETS:
+                count += 1
+                print(f"  [{count}/{total_dd}] {tgt.replace('X%', f'{dd_pct}%')}...")
+                w = run_optimization(
+                    opt_returns, tgt, min_w, max_w, group_max, rf,
+                    rebalance="daily", dd_constraint=dd_val,
+                    current_weights=prev_w.get(tgt),
+                    dd_returns=bt_returns, dd_asset_starts=bt_asset_starts,
+                )
+                dd_w[dd_pct][tgt] = w
+                prev_w[tgt] = w
+
+        # DD Momentum
+        print("\nComputing DD Momentum adjustments...")
+        ms_weights = base_w["Max Sharpe Ratio"]
+        years = sorted(set(returns_full.index.year))
+        checkpoints = []
+        for y in years:
+            yr_dates = returns_full.index[returns_full.index.year == y]
+            if len(yr_dates) > 0:
+                checkpoints.append(yr_dates[0])
+        optimal_sched = load_optimal_bump_schedule()
+        if optimal_sched is not None:
+            print("  Using optimised per-rank bump schedule")
+            dd_adj = compute_dd_adjustments_scheduled(returns_full, checkpoints, optimal_sched)
+        else:
+            print("  Using default parametric bump schedule (bump_max=50%)")
+            dd_adj = compute_dd_adjustments(returns_full, checkpoints)
+        print(f"  {len(dd_adj)} annual checkpoints computed")
+
+        # Regime portfolios
+        macro_path = Path(__file__).resolve().parent / "Inflation and IR.xlsx"
+        macro_data = load_regime_data(macro_path)
+        regime_weights = None
+        regime_series = None
+        regime_weights_by_dd = {}
+        if macro_data is not None:
+            print("\nComputing regime portfolios...")
+            regime_series = classify_regimes(macro_data)
+            regime_weights = optimize_per_regime(
                 opt_returns, regime_series, "Max Sharpe Ratio",
                 min_w, max_w, group_max, rf, rebalance="daily",
-                dd_constraint=dd_val,
-                dd_returns=bt_returns, dd_asset_starts=bt_asset_starts,
             )
-            regime_weights_by_dd[dd_pct] = rw
-    else:
-        print("\nNo macro data found — skipping regime pre-computation")
+            for label_id, w in regime_weights.items():
+                print(f"  Regime {label_id} (unconstrained): done")
+            for dd_pct in DD_LEVELS:
+                dd_val = dd_pct / 100.0
+                print(f"  Regime weights with DD≤{dd_pct}%...")
+                rw = optimize_per_regime(
+                    opt_returns, regime_series, "Max Sharpe Ratio",
+                    min_w, max_w, group_max, rf, rebalance="daily",
+                    dd_constraint=dd_val,
+                    dd_returns=bt_returns, dd_asset_starts=bt_asset_starts,
+                )
+                regime_weights_by_dd[dd_pct] = rw
+        else:
+            print("\nNo macro data found — skipping regime pre-computation")
 
-    # Save weights only (stats are recomputed at runtime for any backtest period)
+        all_variants[btc_label] = {
+            "base_weights": base_w,
+            "dd_weights": dd_w,
+            "dd_momentum_adjustments": dd_adj,
+            "dd_momentum_base": ms_weights,
+            "regime_weights": regime_weights,
+            "regime_weights_by_dd": regime_weights_by_dd,
+            "regime_series": regime_series,
+        }
+
+    # Save both variants plus shared metadata
+    # Keep backward-compatible keys from the excl_btc variant (default)
     output = {
-        "base_weights": base_w,
-        "dd_weights": dd_w,
-        "dd_momentum_adjustments": dd_adj,
-        "dd_momentum_base": ms_weights,
-        "regime_weights": regime_weights,
-        "regime_weights_by_dd": regime_weights_by_dd,
-        "regime_series": regime_series,
+        **all_variants["excl_btc"],
+        "btc_variants": all_variants,
         "overlap_start": overlap_start,
         "data_end": returns_full.index[-1],
         "default_min": DEFAULT_MIN,
