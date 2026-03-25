@@ -9,7 +9,20 @@ import hashlib
 import subprocess
 from pathlib import Path
 
-APP_VERSION = "1.4.0"
+_APP_MAJOR_MINOR = "1.4"
+
+def _get_app_version():
+    try:
+        count = subprocess.check_output(
+            ["git", "rev-list", "--count", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return f"{_APP_MAJOR_MINOR}.{count}"
+    except Exception:
+        return f"{_APP_MAJOR_MINOR}.0"
+
+APP_VERSION = _get_app_version()
 
 from data import ASSETS, GROUP_MAP, GROUP_NAMES, load_data
 from stats import (
@@ -153,22 +166,6 @@ cfd_financing_opt = st.sidebar.number_input(
     key="cfd_financing_opt",
     help="Annual CFD financing rate for leverage-aware strategies.",
 ) / 100.0
-
-# Version display in sidebar
-def _get_git_hash():
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(Path(__file__).resolve().parent),
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-    except Exception:
-        return ""
-
-_git_hash = _get_git_hash()
-_version_str = f"v{APP_VERSION}" + (f" ({_git_hash})" if _git_hash else "")
-st.sidebar.markdown("---")
-st.sidebar.caption(_version_str)
 
 # Base strategies (always computed once)
 _BASE_TARGETS = [
@@ -2280,3 +2277,8 @@ with tab_settings:
         st.session_state.asset_max = dict(_DEFAULT_MAX)
         st.session_state.group_max = dict(_DEFAULT_GROUP_MAX)
         st.rerun()
+
+# ──────────────────────────────────────────────
+# Version (bottom of page)
+# ──────────────────────────────────────────────
+st.caption(f"v{APP_VERSION}")
