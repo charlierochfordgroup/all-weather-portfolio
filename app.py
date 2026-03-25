@@ -333,8 +333,7 @@ def _constraints_are_default():
     return (st.session_state.asset_min == _DEFAULT_MIN and
             st.session_state.asset_max == _DEFAULT_MAX and
             st.session_state.group_max == _DEFAULT_GROUP_MAX and
-            abs(risk_free_rate - 0.05) < 1e-9 and
-            exclude_bitcoin)
+            abs(risk_free_rate - 0.05) < 1e-9)
 
 
 def _stats_from_weights(base_w, dd_w, bt_data, rf, rb, a_starts):
@@ -438,8 +437,6 @@ def _load_or_compute(opt_data, bt_data, rf, rb,
                     )
                     s = calc_stats(bt_data, w, rf, rebalance=rb, asset_starts=a_starts)
                     base_results[tgt] = {"weights": w, "stats": s}
-            with open(_cache_file, "wb") as f:
-                pickle.dump((base_results, dd_results), f)
             return base_results, dd_results
         except Exception:
             pass
@@ -482,9 +479,24 @@ def _load_or_compute(opt_data, bt_data, rf, rb,
         with open(_opt_cache_file, "wb") as f:
             pickle.dump((base_w, dd_w), f)
 
-    # Cache full results
-    with open(_cache_file, "wb") as f:
-        pickle.dump((base_results, dd_results), f)
+    # Cache full results — convert stats to dicts to avoid pickle issues
+    # with Streamlit's module reloading (PortfolioStats class identity changes)
+    try:
+        _cacheable_base = {
+            t: {"weights": d["weights"], "stats": vars(d["stats"]) if hasattr(d["stats"], '__dict__') else d["stats"]}
+            for t, d in base_results.items()
+        }
+        _cacheable_dd = {
+            dd_pct: {
+                t: {"weights": d["weights"], "stats": vars(d["stats"]) if hasattr(d["stats"], '__dict__') else d["stats"]}
+                for t, d in targets.items()
+            }
+            for dd_pct, targets in dd_results.items()
+        }
+        with open(_cache_file, "wb") as f:
+            pickle.dump((_cacheable_base, _cacheable_dd), f)
+    except Exception:
+        pass  # Non-fatal: cache miss next time, but don't block the app
     return base_results, dd_results
 
 
@@ -548,8 +560,11 @@ if st.session_state.get("defaults_cache_key") != cache_key:
         st.session_state.base_results = base_results
         st.session_state.dd_results = dd_results
         st.session_state.defaults_cache_key = cache_key
-        with open(cache_file, "wb") as f:
-            pickle.dump((base_results, dd_results), f)
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump((base_results, dd_results), f)
+        except Exception:
+            pass  # PortfolioStats can't be pickled; non-fatal
     else:
         with st.spinner("⏳ Computing portfolios — this may take a couple of minutes on first run..."):
             base_results, dd_results = _load_or_compute(
