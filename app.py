@@ -13,7 +13,7 @@ from stats import (
     calc_stats, compute_equity_curve, compute_drawdown_series,
     compute_annual_returns, compute_asset_starts,
 )
-from optimizer import run_optimization, _group_indices
+from optimizer import run_optimization
 from cfd import analyze_cfd
 from regime import load_regime_data, classify_regimes, optimize_per_regime, build_regime_schedule, regime_analytics, REGIME_LABELS
 from dd_momentum import (
@@ -73,8 +73,11 @@ data_end = returns_full.index[-1].date()
 
 st.sidebar.header("Analysis Settings")
 
-# Inception mode: if user clicked inception, override the default start date
-_start_default = overlap_start_date
+# Default start: 50 years back from today (or earliest data if less available)
+import datetime as _dt
+_fifty_years_back = (_dt.date.today() - _dt.timedelta(days=50 * 365)).isoformat()
+_start_default_50y = max(data_start_earliest, pd.Timestamp(_fifty_years_back).date())
+_start_default = _start_default_50y
 if st.session_state.get("_use_inception", False):
     _start_default = data_start_earliest
 
@@ -99,7 +102,7 @@ if extended_backtest:
         f"Optimiser uses overlap period from {overlap_start_date}."
     )
 
-risk_free_pct = st.sidebar.number_input("Risk-Free Rate (%)", value=4.0, min_value=0.0, max_value=20.0, step=0.5, format="%.1f",
+risk_free_pct = st.sidebar.number_input("Risk-Free Rate (%)", value=5.0, min_value=0.0, max_value=20.0, step=0.5, format="%.1f",
                                         help="Used for Sharpe ratio calculation and CFD cash reserve growth rate.")
 risk_free_rate = risk_free_pct / 100.0
 
@@ -110,35 +113,37 @@ _REBAL_OPTIONS = {
     "Semi-Annual": "semi-annual",
     "Annual": "annual",
 }
-rebalance_freq = st.sidebar.selectbox("Rebalancing Frequency", list(_REBAL_OPTIONS.keys()))
+rebalance_freq = st.sidebar.selectbox("Rebalancing Frequency", list(_REBAL_OPTIONS.keys()),
+                                      index=list(_REBAL_OPTIONS.keys()).index("Monthly"))
 rebalance = _REBAL_OPTIONS[rebalance_freq]
 
-_DD_LEVELS = [5, 10, 15, 20, 25, 30]
+_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 dd_constraint_pct = st.sidebar.selectbox(
     "Max Drawdown Constraint (%)",
     _DD_LEVELS,
-    index=_DD_LEVELS.index(20),
+    index=_DD_LEVELS.index(30),
     key="dd_constraint_select",
 )
 dd_constraint_val = dd_constraint_pct / 100.0
-_TV_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 50]
+_TV_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 tv_dd_constraint_pct = st.sidebar.selectbox(
     "Max DD \u2013 Time-Varying (%)",
     _TV_DD_LEVELS,
-    index=_TV_DD_LEVELS.index(20),
+    index=_TV_DD_LEVELS.index(30),
     key="tv_dd_constraint_select",
     help="Separate drawdown cap for Regime-Based and DD P-Value Momentum strategies. "
          "Enforced as a hard constraint on the full backtest equity curve.",
 )
 tv_dd_constraint_val = tv_dd_constraint_pct / 100.0
-exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=False)
+exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Leverage Settings**")
 cfd_leverage_opt = st.sidebar.number_input(
-    "Target Leverage (x)", min_value=1.0, max_value=10.0, value=3.0, step=0.5,
+    "Target Leverage (x)", min_value=1.0, max_value=10.0, value=5.0, step=0.5,
     key="cfd_leverage_opt",
-    help="Used by Leverage-Optimal and Carry-Adjusted RP strategies.",
+    help="Target leverage for the Leverage-Optimal and Carry-Adjusted RP strategies. "
+         "Higher leverage penalises volatility quadratically via vol drag.",
 )
 cfd_financing_opt = st.sidebar.number_input(
     "Financing Rate (% p.a.)", min_value=0.0, max_value=15.0, value=6.5, step=0.5,
@@ -328,8 +333,8 @@ def _constraints_are_default():
     return (st.session_state.asset_min == _DEFAULT_MIN and
             st.session_state.asset_max == _DEFAULT_MAX and
             st.session_state.group_max == _DEFAULT_GROUP_MAX and
-            abs(risk_free_rate - 0.04) < 1e-9 and
-            not exclude_bitcoin)
+            abs(risk_free_rate - 0.05) < 1e-9 and
+            exclude_bitcoin)
 
 
 def _stats_from_weights(base_w, dd_w, bt_data, rf, rb, a_starts):
@@ -529,7 +534,6 @@ if st.session_state.get("defaults_cache_key") != cache_key:
         else:
             # Toggling OFF: reload from the non-BTC-excluded cache/precomputed weights
             # Build the non-BTC cache key to find pre-existing results
-            _saved_btc = exclude_bitcoin
             # Try loading from disk cache or precomputed weights (fast path)
             base_results, dd_results = _load_or_compute(
                 opt_returns, returns, risk_free_rate, rebalance,
@@ -878,18 +882,6 @@ _STATS_COL_CONFIG = {
     "% Pos Days": st.column_config.NumberColumn("% Pos Days", format="%.2f%%"),
     "Longest DD": st.column_config.NumberColumn("Longest DD", format="%d days"),
 }
-
-
-def _style_current_dd(val):
-    """Conditional background colour for Current DD column."""
-    if not isinstance(val, (int, float)):
-        return ""
-    if val >= -0.01:
-        return "background-color: rgba(0, 200, 83, 0.2)"   # green – at peak
-    elif val >= -10.0:
-        return "background-color: rgba(255, 165, 0, 0.2)"   # amber – shallow
-    else:
-        return "background-color: rgba(255, 23, 68, 0.2)"   # red – deep
 
 
 def _risk_analytics(weights, label="Portfolio"):
@@ -1835,7 +1827,7 @@ with tab_cfd:
         st.header("10-Year Monte Carlo Projection")
         st.caption("Forward simulation using historical CAGR and volatility with geometric Brownian motion (500 paths).")
 
-        n_paths = 2000
+        n_paths = 500
         n_years = 10
         n_days_mc = 252 * n_years
         years_axis = np.linspace(0, n_years, n_days_mc + 1)
@@ -2146,7 +2138,7 @@ with tab_guide:
             "Financing is charged on the full notional value (rate × leverage), matching CMC Markets."
         )
         st.markdown(
-            "The Monte Carlo projection runs 2,000 GBM paths calibrated to each portfolio's CAGR and "
+            "The Monte Carlo projection runs 500 GBM paths calibrated to each portfolio's CAGR and "
             "volatility, showing P5–P95 outcomes over 10 years. Leveraged returns account for volatility "
             "drag and financing costs. The cash reserve earns 0% (CMC does not pay interest on idle cash)."
         )

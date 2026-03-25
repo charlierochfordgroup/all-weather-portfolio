@@ -26,7 +26,9 @@ from dd_momentum import (
 )
 
 # ── Default settings (must match app.py defaults exactly) ──
-RISK_FREE_RATE = 0.04
+RISK_FREE_RATE = 0.05
+LEVERAGE = 5.0
+FINANCING_RATE = 0.065
 
 DEFAULT_MIN = {a: 0.5 for a in ASSETS}
 DEFAULT_MAX = {
@@ -46,9 +48,12 @@ BASE_TARGETS = [
     "Max Sharpe Ratio", "Min Volatility", "Max Calmar Ratio",
     "Minimize Max Drawdown",
     "Inverse Volatility", "Equal Risk Contribution", "Hierarchical Risk Parity",
+    "Leverage-Optimal",
+    "Carry-Adjusted Risk Parity",
+    "Adaptive Lookback Blend",
 ]
 DD_TARGETS = ["Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)"]
-DD_LEVELS = [5, 10, 15, 20, 25, 30]
+DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 
 
 def main():
@@ -65,6 +70,10 @@ def main():
 
     min_w = np.array([DEFAULT_MIN.get(a, 0.5) / 100.0 for a in ASSETS])
     max_w = np.array([DEFAULT_MAX.get(a, 30.0) / 100.0 for a in ASSETS])
+    # Exclude Bitcoin by default (matches app.py default)
+    btc_idx = ASSETS.index("Bitcoin")
+    min_w[btc_idx] = 0.0
+    max_w[btc_idx] = 0.0
     group_max = {g: v / 100.0 for g, v in DEFAULT_GROUP_MAX.items()}
     rf = RISK_FREE_RATE
 
@@ -79,7 +88,8 @@ def main():
     base_w = {}
     for i, tgt in enumerate(BASE_TARGETS, 1):
         print(f"  [{i}/{len(BASE_TARGETS)}] {tgt}...")
-        w = run_optimization(opt_returns, tgt, min_w, max_w, group_max, rf, rebalance="daily")
+        w = run_optimization(opt_returns, tgt, min_w, max_w, group_max, rf, rebalance="daily",
+                             leverage=LEVERAGE, financing_rate=FINANCING_RATE)
         base_w[tgt] = w
 
     # DD-constrained strategies (warm-started from previous level)
