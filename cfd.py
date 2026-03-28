@@ -6,6 +6,54 @@ from dataclasses import dataclass
 from data import ASSETS
 from stats import PortfolioStats
 
+# Estimated annual dividend / coupon yield per asset (as a fraction).
+# Used to compute the tax drag from CFD dividend adjustments, which are
+# paid as cash (taxed as ordinary income) rather than reinvested gross.
+# Yields are approximate long-run averages — the haircut captures the
+# incremental cost vs. a gross total-return index.
+ASSET_DIVIDEND_YIELDS = {
+    "Cash":                 0.000,
+    "Nasdaq":               0.008,
+    "S&P 500":              0.015,
+    "Russell 2000":         0.015,
+    "ASX200":               0.035,
+    "Emerging Markets":     0.025,
+    "Corporate Bonds":      0.045,
+    "Long-Term Treasuries": 0.040,
+    "Short-Term Treasuries":0.045,
+    "US REITs":             0.040,
+    "Industrial Metals":    0.000,
+    "Gold":                 0.000,
+    "Bitcoin":              0.000,
+    "Infrastructure":       0.035,
+    "Japan Equities":       0.020,
+    "UK Equities":          0.035,
+    "EU Equities":          0.025,
+    "US TIPS":              0.025,
+    "High Yield":           0.060,
+    "EM Debt":              0.050,
+    "JPY":                  0.000,
+    "CHF":                  0.000,
+    "CNY":                  0.000,
+    "China Equities":       0.020,
+    "Copper":               0.000,
+    "Soft Commodities":     0.000,
+}
+
+CFD_DIVIDEND_TAX_RATE = 0.18  # marginal tax rate applied to dividend adjustments
+
+
+def portfolio_dividend_drag(weights: np.ndarray, tax_rate: float = CFD_DIVIDEND_TAX_RATE) -> float:
+    """Return the annual CAGR drag from taxed dividend adjustments (unleveraged).
+
+    drag = sum_i( weight_i * yield_i ) * tax_rate
+    """
+    total_yield = sum(
+        weights[i] * ASSET_DIVIDEND_YIELDS.get(asset, 0.0)
+        for i, asset in enumerate(ASSETS)
+    )
+    return total_yield * tax_rate
+
 
 @dataclass
 class CFDAnalysis:
@@ -24,11 +72,12 @@ class CFDAnalysis:
     margin_utilisation: float         # margin / deployed capital as %
 
     # Return metrics (after financing)
-    gross_cagr: float                 # leveraged CAGR before financing
+    gross_cagr: float                 # leveraged CAGR before financing or dividend drag
+    dividend_drag: float              # annual drag from taxed dividend adjustments (leveraged)
     financing_drag: float             # annual financing cost
-    net_cagr: float                   # CAGR after financing on deployed capital
+    net_cagr: float                   # CAGR after all drags on deployed capital
     leveraged_volatility: float       # vol scaled by leverage
-    net_sharpe: float                 # Sharpe after financing
+    net_sharpe: float                 # Sharpe after all costs
 
     # Capital-adjusted return (CAGR relative to total capital including reserve)
     effective_cagr: float             # net return as % of total capital
@@ -88,14 +137,25 @@ def analyze_cfd(
     for i, asset in enumerate(ASSETS):
         capital_per_asset[asset] = weights[i] * notional
 
+    # Dividend drag (unleveraged): reduce base CAGR before leveraging.
+    # Dividend adjustments are taxed as ordinary income; the total-return
+    # index assumes reinvestment gross of tax, so we apply the shortfall.
+    div_drag_ul = portfolio_dividend_drag(weights)
+    adjusted_cagr = stats.cagr - div_drag_ul
+
     # Leveraged returns — account for volatility drag of leverage.
     # Daily-rebalanced leverage scales daily returns by L, so:
     #   CAGR_L = (1+CAGR)^L * exp(-L*(L-1)*σ²/2) - 1
     # The exp term captures the excess vol drag from leverage (scales as L²).
     vol = stats.volatility
-    gross_cagr = ((1.0 + stats.cagr) ** leverage_ratio
+    gross_cagr = ((1.0 + adjusted_cagr) ** leverage_ratio
                   * np.exp(-leverage_ratio * (leverage_ratio - 1.0) * vol**2 / 2.0)
                   - 1.0)
+
+    # The unleveraged drag gets amplified by leverage when expressed on
+    # deployed capital — show the leveraged equivalent as a line item.
+    div_drag_leveraged = div_drag_ul * leverage_ratio
+
     # CMC Markets charges financing on the FULL notional (not just borrowed portion).
     # Annual drag = financing_rate × leverage (since notional = deployed × leverage).
     # Expressed as drag on deployed capital: financing_rate × leverage.
@@ -127,6 +187,7 @@ def analyze_cfd(
         max_drawdown_dollars=max_dd_dollars,
         margin_utilisation=margin_util,
         gross_cagr=gross_cagr,
+        dividend_drag=div_drag_leveraged,
         financing_drag=financing_drag,
         net_cagr=net_cagr,
         leveraged_volatility=leveraged_vol,

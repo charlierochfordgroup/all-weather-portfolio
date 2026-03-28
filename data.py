@@ -11,8 +11,11 @@ from pathlib import Path
 ASSETS = [
     "Cash", "Nasdaq", "S&P 500", "Russell 2000", "ASX200",
     "Emerging Markets", "Corporate Bonds", "Long-Term Treasuries",
-    "Short-Term Treasuries", "Real Estate", "Commodities", "Gold",
+    "Short-Term Treasuries", "US REITs", "Industrial Metals", "Gold",
     "Bitcoin", "Infrastructure", "Japan Equities", "UK Equities", "EU Equities",
+    "US TIPS", "High Yield", "EM Debt",
+    "JPY", "CHF", "CNY",
+    "China Equities", "Copper", "Soft Commodities",
 ]
 
 GROUP_MAP = {
@@ -22,20 +25,29 @@ GROUP_MAP = {
     "Russell 2000": "US Equities",
     "ASX200": "Intl Equities",
     "Emerging Markets": "Intl Equities",
+    "China Equities": "Intl Equities",
     "Corporate Bonds": "Bonds",
     "Long-Term Treasuries": "Bonds",
     "Short-Term Treasuries": "Bonds",
-    "Real Estate": "Real Assets",
-    "Commodities": "Real Assets",
+    "US TIPS": "Bonds",
+    "High Yield": "Bonds",
+    "EM Debt": "Bonds",
+    "US REITs": "Real Assets",
+    "Industrial Metals": "Real Assets",
     "Gold": "Real Assets",
-    "Bitcoin": "Alternatives",
+    "Copper": "Real Assets",
+    "Soft Commodities": "Real Assets",
     "Infrastructure": "Real Assets",
+    "Bitcoin": "Alternatives",
     "Japan Equities": "Intl Equities",
     "UK Equities": "Intl Equities",
     "EU Equities": "Intl Equities",
+    "JPY": "Currencies",
+    "CHF": "Currencies",
+    "CNY": "Currencies",
 }
 
-GROUP_NAMES = ["US Equities", "Intl Equities", "Bonds", "Real Assets", "Alternatives"]
+GROUP_NAMES = ["US Equities", "Intl Equities", "Bonds", "Real Assets", "Alternatives", "Currencies"]
 
 
 def load_prices_from_excel(path: str) -> dict[str, pd.Series]:

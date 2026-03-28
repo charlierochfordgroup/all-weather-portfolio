@@ -35,13 +35,16 @@ DEFAULT_MAX = {
     "Cash": 20.0, "Nasdaq": 30.0, "S&P 500": 30.0, "Russell 2000": 30.0,
     "ASX200": 30.0, "Emerging Markets": 30.0,
     "Corporate Bonds": 40.0, "Long-Term Treasuries": 40.0, "Short-Term Treasuries": 40.0,
-    "Real Estate": 20.0, "Commodities": 10.0, "Gold": 20.0,
+    "US REITs": 20.0, "Industrial Metals": 15.0, "Gold": 20.0,
     "Bitcoin": 15.0, "Infrastructure": 20.0,
     "Japan Equities": 30.0, "UK Equities": 30.0, "EU Equities": 30.0,
+    "US TIPS": 30.0, "High Yield": 20.0, "EM Debt": 20.0,
+    "JPY": 20.0, "CHF": 20.0, "CNY": 10.0,
+    "China Equities": 20.0, "Copper": 15.0, "Soft Commodities": 15.0,
 }
 DEFAULT_GROUP_MAX = {
-    "US Equities": 35.0, "Intl Equities": 30.0, "Bonds": 40.0,
-    "Real Assets": 30.0, "Alternatives": 20.0,
+    "US Equities": 35.0, "Intl Equities": 30.0, "Bonds": 50.0,
+    "Real Assets": 30.0, "Alternatives": 20.0, "Currencies": 25.0,
 }
 
 

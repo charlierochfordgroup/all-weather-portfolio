@@ -89,11 +89,10 @@ data_end = returns_full.index[-1].date()
 
 st.sidebar.header("Analysis Settings")
 
-# Default start: 50 years back from today (or earliest data if less available)
+# Default start: date when 50% of assets have data (1983-08-31)
 import datetime as _dt
-_fifty_years_back = (_dt.date.today() - _dt.timedelta(days=50 * 365)).isoformat()
-_start_default_50y = max(data_start_earliest, pd.Timestamp(_fifty_years_back).date())
-_start_default = _start_default_50y
+_start_default_50pct = pd.Timestamp("1983-08-31").date()
+_start_default = _start_default_50pct
 if st.session_state.get("_use_inception", False):
     _start_default = data_start_earliest
 
@@ -137,7 +136,7 @@ _DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 dd_constraint_pct = st.sidebar.selectbox(
     "Max Drawdown Constraint (%)",
     _DD_LEVELS,
-    index=_DD_LEVELS.index(30),
+    index=_DD_LEVELS.index(50),
     key="dd_constraint_select",
 )
 dd_constraint_val = dd_constraint_pct / 100.0
@@ -145,13 +144,13 @@ _TV_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 tv_dd_constraint_pct = st.sidebar.selectbox(
     "Max DD \u2013 Time-Varying (%)",
     _TV_DD_LEVELS,
-    index=_TV_DD_LEVELS.index(30),
+    index=_TV_DD_LEVELS.index(50),
     key="tv_dd_constraint_select",
     help="Separate drawdown cap for Regime-Based and DD P-Value Momentum strategies. "
          "Enforced as a hard constraint on the full backtest equity curve.",
 )
 tv_dd_constraint_val = tv_dd_constraint_pct / 100.0
-exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=True)
+exclude_bitcoin = st.sidebar.checkbox("Exclude Bitcoin", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Leverage Settings**")
@@ -169,12 +168,11 @@ cfd_financing_opt = st.sidebar.number_input(
 
 # Base strategies (always computed once)
 _BASE_TARGETS = [
-    "Max Sharpe Ratio", "Min Volatility", "Max Calmar Ratio",
-    "Minimize Max Drawdown",
-    "Inverse Volatility", "Equal Risk Contribution", "Hierarchical Risk Parity",
+    "Max Sharpe Ratio", "Max Calmar Ratio",
     "Leverage-Optimal",
     "Carry-Adjusted Risk Parity",
-    "Adaptive Lookback Blend",
+    "Max Sharpe (Unconstrained)",
+    "Leverage-Optimal (Unconstrained)",
 ]
 
 # DD-constrained targets (computed for each DD level)
@@ -204,13 +202,16 @@ _DEFAULT_MAX = {
     "Cash": 20.0, "Nasdaq": 30.0, "S&P 500": 30.0, "Russell 2000": 30.0,
     "ASX200": 30.0, "Emerging Markets": 30.0,
     "Corporate Bonds": 40.0, "Long-Term Treasuries": 40.0, "Short-Term Treasuries": 40.0,
-    "Real Estate": 20.0, "Commodities": 10.0, "Gold": 20.0,
+    "US REITs": 20.0, "Industrial Metals": 15.0, "Gold": 20.0,
     "Bitcoin": 15.0, "Infrastructure": 20.0,
     "Japan Equities": 30.0, "UK Equities": 30.0, "EU Equities": 30.0,
+    "US TIPS": 30.0, "High Yield": 20.0, "EM Debt": 20.0,
+    "JPY": 20.0, "CHF": 20.0, "CNY": 10.0,
+    "China Equities": 20.0, "Copper": 15.0, "Soft Commodities": 15.0,
 }
 _DEFAULT_GROUP_MAX = {
-    "US Equities": 35.0, "Intl Equities": 30.0, "Bonds": 40.0,
-    "Real Assets": 30.0, "Alternatives": 20.0,
+    "US Equities": 35.0, "Intl Equities": 30.0, "Bonds": 50.0,
+    "Real Assets": 30.0, "Alternatives": 20.0, "Currencies": 25.0,
 }
 
 # Initialise constraint session state
@@ -235,14 +236,14 @@ if exclude_bitcoin:
 # ──────────────────────────────────────────────
 # FIXED BENCHMARK PORTFOLIOS
 # ──────────────────────────────────────────────
-# Ray Dalio All Weather: 30% Stocks, 40% LT Bonds, 15% IT Bonds, 7.5% Gold, 7.5% Commodities
+# Ray Dalio All Weather: 30% Stocks, 40% LT Bonds, 15% IT Bonds, 7.5% Gold, 7.5% Industrial Metals
 _DALIO_WEIGHTS = np.zeros(n)
 _DALIO_MAP = {
     "S&P 500": 0.30,
     "Long-Term Treasuries": 0.40,
     "Short-Term Treasuries": 0.15,
     "Gold": 0.075,
-    "Commodities": 0.075,
+    "Industrial Metals": 0.075,
 }
 for _asset, _w in _DALIO_MAP.items():
     _DALIO_WEIGHTS[ASSETS.index(_asset)] = _w
@@ -825,39 +826,6 @@ st.session_state.portfolios["DD Budget (time-varying)"] = {
 }
 st.session_state._budget_schedule = _budget_schedule
 
-# --- Ensemble Meta-Strategy ---
-from ensemble import build_ensemble_schedule, ensemble_analytics
-
-_ensemble_constituents = {}
-for pname, pdata in st.session_state.portfolios.items():
-    if "weights_schedule" not in pdata:  # static strategies only
-        _ensemble_constituents[pname] = pdata["weights"]
-
-if len(_ensemble_constituents) >= 2:
-    _rebal_for_ensemble = rebalance if rebalance != "daily" else "quarterly"
-    _ensemble_schedule = build_ensemble_schedule(
-        _ensemble_constituents, returns, risk_free_rate,
-        rebalance=_rebal_for_ensemble, asset_starts=bt_asset_starts,
-    )
-    _ensemble_schedule = _enforce_schedule_dd(
-        _ensemble_schedule, returns,
-        np.mean(list(_ensemble_constituents.values()), axis=0),
-        tv_dd_constraint_val, risk_free_rate, _rebal_for_ensemble, bt_asset_starts,
-    )
-    _ensemble_repr_w = _ensemble_schedule[max(_ensemble_schedule.keys())] if _ensemble_schedule else np.mean(list(_ensemble_constituents.values()), axis=0)
-    _ensemble_stats = calc_stats(
-        returns, _ensemble_repr_w, risk_free_rate,
-        rebalance=_rebal_for_ensemble, asset_starts=bt_asset_starts,
-        weights_schedule=_ensemble_schedule,
-    )
-    st.session_state.portfolios["Ensemble (time-varying)"] = {
-        "weights": _ensemble_repr_w,
-        "stats": _ensemble_stats,
-        "weights_schedule": _ensemble_schedule,
-        "strategy_type": "ensemble",
-    }
-    st.session_state._ensemble_schedule = _ensemble_schedule
-    st.session_state._ensemble_constituents = _ensemble_constituents
 
 # --- Yield Curve Signal Overlay ---
 if _macro_data is not None and "base_results" in st.session_state:
@@ -1615,51 +1583,7 @@ with tab_dynamic:
     else:
         st.info("DD Budget data not available.")
 
-    # ── Section D: Ensemble Meta-Strategy ──
-    st.markdown("---")
-    st.subheader("Ensemble Meta-Strategy")
-    st.caption("Blends static strategies weighted by trailing 12-month inverse-volatility. "
-               "Diversifies across methodologies, not just assets.")
-
-    if "_ensemble_constituents" in st.session_state and "_ensemble_schedule" in st.session_state:
-        _ea = ensemble_analytics(st.session_state._ensemble_constituents, returns, risk_free_rate)
-        _ea_df = pd.DataFrame({
-            "Strategy": _ea["strategy_names"],
-            "Allocation": _ea["allocations"],
-            "Trailing Vol": _ea["trailing_vols"],
-            "Trailing Sharpe": _ea["trailing_sharpes"],
-        })
-        st.dataframe(
-            _ea_df,
-            column_config={
-                "Strategy": st.column_config.TextColumn("Strategy"),
-                "Allocation": st.column_config.NumberColumn("Allocation", format="%.1f%%"),
-                "Trailing Vol": st.column_config.NumberColumn("Trailing Vol", format="%.2f%%"),
-                "Trailing Sharpe": st.column_config.NumberColumn("Trailing Sharpe", format="%.2f"),
-            },
-            width="stretch", hide_index=True,
-        )
-
-        # Equity curve comparison
-        if "Ensemble (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
-            st.caption("Ensemble vs Max Sharpe (Static)")
-            _ens_repr = st.session_state.portfolios["Ensemble (time-varying)"]["weights"]
-            eq_ens = compute_equity_curve(returns, _ens_repr,
-                                          rebalance=_rebal_for_ensemble, asset_starts=bt_asset_starts,
-                                          weights_schedule=st.session_state._ensemble_schedule)
-            _ms_w_e = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
-            eq_sharpe_e = compute_equity_curve(returns, _ms_w_e,
-                                               rebalance=rebalance, asset_starts=bt_asset_starts)
-            fig_ev = go.Figure()
-            fig_ev.add_trace(go.Scatter(x=eq_ens.index, y=eq_ens.values, name="Ensemble (time-varying)", line=dict(color="#AB47BC")))
-            fig_ev.add_trace(go.Scatter(x=eq_sharpe_e.index, y=eq_sharpe_e.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
-            fig_ev.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
-                                 template="plotly_white", height=350, hovermode="x unified")
-            st.plotly_chart(fig_ev, width="stretch")
-    else:
-        st.info("Ensemble strategy requires at least 2 static strategies.")
-
-    # ── Section E: Yield Curve Signal Overlay ──
+    # ── Section D: Yield Curve Signal Overlay ──
     st.markdown("---")
     st.subheader("Yield Curve Signal Overlay")
     st.caption("Tilts defensive when the Fed Funds rate is rising >200 bp/yr. "
@@ -1760,11 +1684,13 @@ with tab_cfd:
             ("Max Drawdown ($)", f"${cfd_result.max_drawdown_dollars:,.0f}",
              "Worst-case loss in dollar terms at this leverage"),
             ("Leveraged CAGR (Gross)", f"{cfd_result.gross_cagr:.2%}",
-             "Leveraged CAGR accounting for vol drag, before financing"),
+             "Leveraged CAGR after vol drag and dividend tax drag, before financing"),
+            ("Dividend / Coupon Drag", f"-{cfd_result.dividend_drag:.2%}",
+             "Tax drag on dividend adjustments (est. yield × 18% × leverage) — already reflected in Gross CAGR above"),
             ("Financing Drag", f"-{cfd_result.financing_drag:.2%}",
              "Annual holding cost on full notional (rate × leverage)"),
             ("Net CAGR (on Deployed)", f"{cfd_result.net_cagr:.2%}",
-             "CAGR after financing, on deployed capital"),
+             "CAGR after financing and dividend drag, on deployed capital"),
             ("Effective CAGR (on Total Capital)", f"{cfd_result.effective_cagr:.2%}",
              "Net return as % of total capital incl. reserve"),
             ("Leveraged Volatility", f"{cfd_result.leveraged_volatility:.2%}",
@@ -1828,14 +1754,23 @@ with tab_cfd:
                 ("Corporate Bonds", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
                 ("Long-Term Treasuries", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
                 ("Short-Term Treasuries", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
-                ("Real Estate", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
-                ("Commodities", "Commodity CFD", "Built into spread", "Built into spread", "Forward-based pricing"),
+                ("US REITs", "Share CFD (US)", "Interbank + 2.5% (~7.5%)", "Interbank \u2013 2.5%", "USD benchmark"),
+                ("Industrial Metals", "Commodity CFD", "Built into spread", "Built into spread", "Forward-based pricing"),
                 ("Gold", "Commodity CFD", "SOFR + spread (~6.8%)", "SOFR \u2013 spread", "Precious metals pricing"),
                 ("Bitcoin", "Crypto CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Higher spreads typical"),
                 ("Infrastructure", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "Varies by underlying"),
                 ("Japan Equities", "Index CFD", "Interbank + 2.5% (~3.0%)", "Interbank \u2013 2.5%", "BoJ rate benchmark"),
                 ("UK Equities", "Index CFD", "Interbank + 2.5% (~7.0%)", "Interbank \u2013 2.5%", "BoE rate benchmark"),
                 ("EU Equities", "Index CFD", "Interbank + 2.5% (~5.2%)", "Interbank \u2013 2.5%", "ECB refi rate benchmark"),
+                ("US TIPS", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "USD benchmark"),
+                ("High Yield", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "USD benchmark"),
+                ("EM Debt", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "USD benchmark"),
+                ("JPY", "FX CFD", "Tom-next + 1.0%", "Tom-next \u2013 1.0%", "JPY/USD rate differential"),
+                ("CHF", "FX CFD", "Tom-next + 1.0%", "Tom-next \u2013 1.0%", "CHF/USD rate differential"),
+                ("CNY", "FX CFD", "Tom-next + 1.0%", "Tom-next \u2013 1.0%", "CNH/USD rate differential"),
+                ("China Equities", "Index CFD", "Interbank + 2.5%", "Interbank \u2013 2.5%", "CNH benchmark"),
+                ("Copper", "Commodity CFD", "Built into spread", "Built into spread", "Forward-based pricing"),
+                ("Soft Commodities", "Commodity CFD", "Built into spread", "Built into spread", "Forward-based pricing"),
             ]
             _fin_df = pd.DataFrame(_fin_rates, columns=["Asset", "CMC Product Type", "Long Rate", "Short Rate", "Notes"])
             st.dataframe(_fin_df, hide_index=True, width="stretch")

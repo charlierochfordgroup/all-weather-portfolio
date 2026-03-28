@@ -621,7 +621,20 @@ def run_optimization(
     financing_rate: float = 0.065,
 ) -> np.ndarray:
     """Dispatch to the appropriate optimization strategy."""
-    if target == "Inverse Volatility":
+    # Unconstrained variants: strip group caps, use the underlying objective
+    if target == "Max Sharpe (Unconstrained)":
+        return optimize_portfolio(
+            returns, "Max Sharpe Ratio", min_w, max_w, {},
+            risk_free_rate, current_weights, rebalance, dd_constraint,
+            dd_returns, dd_asset_starts, leverage, financing_rate,
+        )
+    elif target == "Leverage-Optimal (Unconstrained)":
+        return optimize_portfolio(
+            returns, "Leverage-Optimal", min_w, max_w, {},
+            risk_free_rate, current_weights, rebalance, dd_constraint,
+            dd_returns, dd_asset_starts, leverage, financing_rate,
+        )
+    elif target == "Inverse Volatility":
         return inverse_volatility(returns, min_w, max_w, group_max)
     elif target == "Equal Risk Contribution":
         return equal_risk_contribution(returns, min_w, max_w, group_max)
