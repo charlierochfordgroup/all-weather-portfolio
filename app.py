@@ -140,6 +140,11 @@ dd_constraint_pct = st.sidebar.selectbox(
     key="dd_constraint_select",
 )
 dd_constraint_val = dd_constraint_pct / 100.0
+if rebalance != "daily":
+    st.sidebar.caption(
+        f"⚠️ DD constraints optimised for daily rebalancing. "
+        f"At {rebalance} rebalancing, actual drawdowns may differ slightly."
+    )
 _TV_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 tv_dd_constraint_pct = st.sidebar.selectbox(
     "Max DD \u2013 Time-Varying (%)",

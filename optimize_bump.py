@@ -28,7 +28,7 @@ from dd_momentum import (
     build_dd_momentum_schedule,
 )
 
-RISK_FREE_RATE = 0.04
+RISK_FREE_RATE = 0.05
 
 DEFAULT_MIN = {a: 0.5 for a in ASSETS}
 DEFAULT_MAX = {

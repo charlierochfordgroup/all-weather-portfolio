@@ -44,10 +44,27 @@ def _effective_weights(
 
 
 def _daily_port_log(returns_vals: np.ndarray, weights: np.ndarray, eff_w) -> np.ndarray:
-    """Compute daily portfolio log returns, using effective weights if provided."""
+    """Compute daily portfolio log returns, using effective weights if provided.
+
+    NOTE: This is the geometric approximation (Σ w_i * log(1+r_i)) and is
+    retained for legacy compatibility. Use _daily_port_simple for all new code.
+    """
     if eff_w is not None:
         return np.sum(returns_vals * eff_w, axis=1)
     return returns_vals @ weights
+
+
+def _daily_port_simple(returns_vals: np.ndarray, weights: np.ndarray, eff_w) -> np.ndarray:
+    """Compute daily portfolio simple returns (arithmetic), using effective weights if provided.
+
+    Converts log returns to simple first, then takes the weighted arithmetic
+    sum — the correct formula for a daily-rebalanced portfolio:
+        r_portfolio = Σ w_i * (exp(log_r_i) - 1)
+    """
+    simple_vals = np.exp(returns_vals) - 1.0
+    if eff_w is not None:
+        return np.sum(simple_vals * eff_w, axis=1)
+    return simple_vals @ weights
 
 
 @dataclass
@@ -237,12 +254,12 @@ def calc_stats(
         # Arithmetic mean of simple returns for Sharpe numerator
         arith_mean_daily = np.mean(port_simple) if n_days > 0 else 0.0
     else:
-        port_log = _daily_port_log(returns.values, weights, eff_w)
-        idx = np.exp(np.cumsum(port_log))
-        # Convert log returns to simple for consistent Sharpe calculation
-        port_simple_from_log = np.exp(port_log) - 1.0
-        var_r = np.var(port_simple_from_log, ddof=1) if n_days > 1 else 0.0
-        arith_mean_daily = np.mean(port_simple_from_log) if n_days > 0 else 0.0
+        # Arithmetic simple returns: convert log→simple then weighted sum.
+        # Correct formula for a daily-rebalanced portfolio.
+        port_simple = _daily_port_simple(returns.values, weights, eff_w)
+        idx = np.cumprod(1.0 + port_simple)
+        var_r = np.var(port_simple, ddof=1) if n_days > 1 else 0.0
+        arith_mean_daily = np.mean(port_simple) if n_days > 0 else 0.0
 
     vol = np.sqrt(var_r * TD)
 
@@ -262,12 +279,9 @@ def calc_stats(
     # Max drawdown and longest drawdown (skip all-zero days)
     nonzero_mask = np.any(returns.values != 0, axis=1)
 
-    if rebalance != "daily" or weights_schedule is not None:
-        port_nz_simple = port_simple[nonzero_mask]
-        idx_nz = np.cumprod(1.0 + port_nz_simple)
-    else:
-        port_nz_log = _daily_port_log(returns.values, weights, eff_w)[nonzero_mask]
-        idx_nz = np.exp(np.cumsum(port_nz_log))
+    # Both daily and periodic paths now produce port_simple (arithmetic simple returns)
+    port_nz_simple = port_simple[nonzero_mask]
+    idx_nz = np.cumprod(1.0 + port_nz_simple)
 
     peak = np.maximum.accumulate(idx_nz)
     drawdowns = idx_nz / peak - 1.0
@@ -289,18 +303,12 @@ def calc_stats(
     # Calmar
     calmar = cagr / abs(max_dd) if abs(max_dd) > 1e-4 else 0.0
 
-    # Yearly returns (non-zero days grouped by calendar year)
+    # Yearly returns and pct positive — both paths use simple returns
     dates_nz = returns.index[nonzero_mask]
-    if rebalance != "daily":
-        yearly_df = pd.DataFrame({"ret": port_nz_simple}, index=dates_nz)
-        annual = yearly_df.groupby(yearly_df.index.year)["ret"].apply(
-            lambda x: np.prod(1.0 + x) - 1.0
-        )
-    else:
-        port_nz_log = _daily_port_log(returns.values, weights, eff_w)[nonzero_mask]
-        yearly_df = pd.DataFrame({"ret": port_nz_log}, index=dates_nz)
-        annual = yearly_df.groupby(yearly_df.index.year)["ret"].sum()
-        annual = np.exp(annual) - 1.0
+    yearly_df = pd.DataFrame({"ret": port_nz_simple}, index=dates_nz)
+    annual = yearly_df.groupby(yearly_df.index.year)["ret"].apply(
+        lambda x: np.prod(1.0 + x) - 1.0
+    )
 
     if len(annual) > 0:
         best_year = annual.max()
@@ -309,12 +317,7 @@ def calc_stats(
         best_year = 0.0
         worst_year = 0.0
 
-    # Pct positive days (non-zero days only)
-    if rebalance != "daily":
-        pct_pos = np.mean(port_nz_simple > 0) if len(port_nz_simple) > 0 else 0.0
-    else:
-        port_nz_log = _daily_port_log(returns.values, weights, eff_w)[nonzero_mask]
-        pct_pos = np.mean(port_nz_log > 0) if len(port_nz_log) > 0 else 0.0
+    pct_pos = np.mean(port_nz_simple > 0) if len(port_nz_simple) > 0 else 0.0
 
     return PortfolioStats(
         cagr=cagr,
@@ -359,11 +362,10 @@ def compute_equity_curve(
             r, weights, rebalance, eff_w,
             weights_schedule=weights_schedule,
         )
-        cum = np.cumprod(1.0 + port_simple)
     else:
-        port_log = _daily_port_log(r.values, weights, eff_w)
-        cum = np.exp(np.cumsum(port_log))
+        port_simple = _daily_port_simple(r.values, weights, eff_w)
 
+    cum = np.cumprod(1.0 + port_simple)
     return pd.Series(cum, index=r.index, name="Equity")
 
 
@@ -402,11 +404,9 @@ def compute_annual_returns(
             r, weights, rebalance, eff_w,
             weights_schedule=weights_schedule,
         )
-        sr = pd.Series(port_simple, index=r.index)
-        annual = sr.groupby(sr.index.year).apply(lambda x: np.prod(1.0 + x) - 1.0)
     else:
-        port_log = pd.Series(_daily_port_log(r.values, weights, eff_w), index=r.index)
-        annual_log = port_log.groupby(port_log.index.year).sum()
-        annual = np.exp(annual_log) - 1.0
+        port_simple = _daily_port_simple(r.values, weights, eff_w)
 
+    sr = pd.Series(port_simple, index=r.index)
+    annual = sr.groupby(sr.index.year).apply(lambda x: np.prod(1.0 + x) - 1.0)
     return annual.rename("Annual Return")

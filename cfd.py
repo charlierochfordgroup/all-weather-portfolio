@@ -152,9 +152,13 @@ def analyze_cfd(
                   * np.exp(-leverage_ratio * (leverage_ratio - 1.0) * vol**2 / 2.0)
                   - 1.0)
 
-    # The unleveraged drag gets amplified by leverage when expressed on
-    # deployed capital — show the leveraged equivalent as a line item.
-    div_drag_leveraged = div_drag_ul * leverage_ratio
+    # Exact leveraged dividend drag: difference between gross CAGR with and
+    # without the dividend haircut. This is more accurate than the linear
+    # approximation (div_drag_ul * L) at high leverage or high CAGR.
+    gross_cagr_no_drag = ((1.0 + stats.cagr) ** leverage_ratio
+                          * np.exp(-leverage_ratio * (leverage_ratio - 1.0) * vol**2 / 2.0)
+                          - 1.0)
+    div_drag_leveraged = gross_cagr_no_drag - gross_cagr
 
     # CMC Markets charges financing on the FULL notional (not just borrowed portion).
     # Annual drag = financing_rate × leverage (since notional = deployed × leverage).
@@ -170,9 +174,11 @@ def analyze_cfd(
 
     margin_util = margin_req / deployed_capital if deployed_capital > 0 else 0.0
 
-    # Effective CAGR: net dollar return relative to total capital
+    # Effective CAGR: net dollar return relative to total capital.
+    # Cash reserve is assumed to earn the risk-free rate (e.g. money market).
     if total_capital > 0:
-        effective_cagr = net_cagr * deployed_capital / total_capital
+        effective_cagr = (net_cagr * deployed_capital
+                          + risk_free_rate * cash_reserve) / total_capital
     else:
         effective_cagr = net_cagr
 

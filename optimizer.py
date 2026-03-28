@@ -45,6 +45,7 @@ def clip_normalize(
     n = len(w)
     groups = _group_indices()
 
+    converged = False
     for _ in range(max_iter):
         w = np.clip(w, min_w, max_w)
 
@@ -58,6 +59,7 @@ def clip_normalize(
         total = w.sum()
         if abs(total - 1.0) < 1e-4:
             if np.all(w >= min_w - 5e-4):
+                converged = True
                 break
 
         if total > 1.0 + 1e-4:
@@ -80,6 +82,13 @@ def clip_normalize(
                 w += room * ratio
             else:
                 w /= total
+
+    if not converged:
+        warnings.warn(
+            f"clip_normalize did not converge after {max_iter} iterations "
+            f"(sum={w.sum():.6f}). Constraints may be only approximately satisfied.",
+            stacklevel=2,
+        )
 
     return w
 
@@ -134,8 +143,12 @@ def _objective(
     elif target == "Leverage-Optimal":
         L = leverage
         vol = s.volatility
-        # Post-leverage CAGR: leveraged growth minus vol drag minus financing
-        post_lev_cagr = s.cagr * L - 0.5 * vol**2 * L * (L - 1) - financing_rate * (L - 1)
+        # Post-leverage CAGR: exact geometric form (consistent with cfd.py),
+        # minus financing on the borrowed portion (L-1)x.
+        post_lev_cagr = ((1.0 + s.cagr) ** L
+                         * np.exp(-0.5 * L * (L - 1) * vol**2)
+                         - 1.0
+                         - financing_rate * (L - 1))
         post_lev_vol = vol * L
         if post_lev_vol > 1e-4:
             post_lev_sharpe = (post_lev_cagr - risk_free_rate) / post_lev_vol
@@ -535,8 +548,8 @@ def carry_adjusted_risk_parity(
     min_w: np.ndarray,
     max_w: np.ndarray,
     group_max: dict[str, float],
-    financing_rate: float = 0.07,
-    leverage: float = 3.0,
+    financing_rate: float = 0.065,
+    leverage: float = 5.0,
 ) -> np.ndarray:
     """Equal Risk Contribution adjusted for CFD financing costs.
 
@@ -558,8 +571,11 @@ def carry_adjusted_risk_parity(
     # Net carry = asset return minus financing cost per unit leverage
     net_carry = asset_cagrs - financing_rate
 
-    # Softmax-style carry score: exp(net_carry * scaling_factor)
-    carry_score = np.exp(net_carry * 5.0)
+    # Softmax-style carry score: exp(net_carry * scaling_factor).
+    # Clamp the exponent to [-5, 5] (≈ [0.007, 148] range) before applying
+    # the floor, to prevent overflow from extreme-carry assets (e.g. Bitcoin
+    # in a bull run) dominating the pre-normalisation weights.
+    carry_score = np.exp(np.clip(net_carry * 5.0, -5.0, 5.0))
     carry_score = np.maximum(carry_score, 0.1)  # floor to avoid zeroing out
 
     adjusted = erc_w * carry_score
