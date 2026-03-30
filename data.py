@@ -1,11 +1,24 @@
 """Data loading, alignment, and log return computation."""
 
+import atexit
 import warnings
 import numpy as np
 import pandas as pd
 import shutil
 import tempfile
 from pathlib import Path
+
+# Track temp files created by _safe_open so they can be cleaned up on exit.
+_temp_files: list[Path] = []
+
+def _cleanup_temp_files():
+    for f in _temp_files:
+        try:
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+atexit.register(_cleanup_temp_files)
 
 
 ASSETS = [
@@ -145,6 +158,7 @@ def _safe_open(path: str) -> str:
         try:
             tmp = Path(tempfile.gettempdir()) / f"_awp_{p.name}"
             shutil.copy2(path, tmp)
+            _temp_files.append(tmp)
             return str(tmp)
         except PermissionError:
             raise PermissionError(

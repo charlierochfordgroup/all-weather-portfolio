@@ -99,21 +99,6 @@ def _make_period_labels(index: pd.DatetimeIndex, rebalance: str) -> np.ndarray:
     return index.to_period(freq).astype("int64")
 
 
-def _resolve_schedule_weights(
-    date: pd.Timestamp,
-    weights_schedule: dict[pd.Timestamp, np.ndarray],
-    fallback: np.ndarray,
-) -> np.ndarray:
-    """Look up the most recent weight vector from a schedule for a given date."""
-    best_date = None
-    for d in weights_schedule:
-        if d <= date:
-            if best_date is None or d > best_date:
-                best_date = d
-    if best_date is not None:
-        return weights_schedule[best_date].copy()
-    return fallback.copy()
-
 
 def _periodic_rebal_returns(
     returns: pd.DataFrame,

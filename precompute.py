@@ -142,7 +142,7 @@ def _run_regime_dd(args):
     dd_val = dd_pct / 100.0
     rw = optimize_per_regime(
         returns, regime_series, "Max Sharpe Ratio",
-        min_w, max_w, group_max, rf, rebalance="daily",
+        min_w, max_w, group_max, rf, rebalance=DD_OPT_REBALANCE,
         dd_constraint=dd_val,
         dd_returns=bt_returns, dd_asset_starts=asset_starts,
     )

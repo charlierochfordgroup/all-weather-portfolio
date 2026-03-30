@@ -550,11 +550,17 @@ def carry_adjusted_risk_parity(
     group_max: dict[str, float],
     financing_rate: float = 0.065,
     leverage: float = 5.0,
+    carry_sensitivity: float = 5.0,
 ) -> np.ndarray:
     """Equal Risk Contribution adjusted for CFD financing costs.
 
     Assets with positive net carry (CAGR > financing cost) receive higher
     weights; those with negative carry are underweighted.
+
+    carry_sensitivity controls how aggressively carry differences tilt weights.
+    Higher values concentrate more into high-carry assets; lower values keep
+    the allocation closer to base ERC. The exponent is clamped to [-5, 5]
+    regardless, so values above ~5.0 saturate for carry spreads > 1%.
     """
     # Base ERC weights
     erc_w = equal_risk_contribution(returns, min_w, max_w, group_max)
@@ -571,11 +577,11 @@ def carry_adjusted_risk_parity(
     # Net carry = asset return minus financing cost per unit leverage
     net_carry = asset_cagrs - financing_rate
 
-    # Softmax-style carry score: exp(net_carry * scaling_factor).
+    # Softmax-style carry score: exp(net_carry * carry_sensitivity).
     # Clamp the exponent to [-5, 5] (≈ [0.007, 148] range) before applying
     # the floor, to prevent overflow from extreme-carry assets (e.g. Bitcoin
     # in a bull run) dominating the pre-normalisation weights.
-    carry_score = np.exp(np.clip(net_carry * 5.0, -5.0, 5.0))
+    carry_score = np.exp(np.clip(net_carry * carry_sensitivity, -5.0, 5.0))
     carry_score = np.maximum(carry_score, 0.1)  # floor to avoid zeroing out
 
     adjusted = erc_w * carry_score

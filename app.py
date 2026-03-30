@@ -739,7 +739,7 @@ if _macro_data is not None and "base_results" in st.session_state:
                         _regime_weights = optimize_per_regime(
                             opt_returns, _regime_series, "Max Sharpe Ratio",
                             min_w_default, max_w_default, default_group_max,
-                            risk_free_rate, rebalance="daily",
+                            risk_free_rate, rebalance="monthly",
                             dd_constraint=tv_dd_constraint_val,
                             dd_returns=returns, dd_asset_starts=bt_asset_starts,
                         )
@@ -769,7 +769,7 @@ if _macro_data is not None and "base_results" in st.session_state:
                         _regime_weights = optimize_per_regime(
                             opt_returns, _regime_series, "Max Sharpe Ratio",
                             min_w_default, max_w_default, default_group_max,
-                            risk_free_rate, rebalance="daily",
+                            risk_free_rate, rebalance="monthly",
                             dd_constraint=tv_dd_constraint_val,
                             dd_returns=returns, dd_asset_starts=bt_asset_starts,
                         )
