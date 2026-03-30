@@ -147,7 +147,11 @@ def _run_regime_dd(args):
 
 
 def _run_dd_strategy(args):
-    """Worker for one (dd_pct, target) pair — runs independently, no warm start."""
+    """Worker for one (dd_pct, target) pair — runs independently, no warm start.
+
+    Uses monthly rebalancing for DD constraint evaluation so the constraint is
+    tuned to the default app rebalancing regime (monthly).
+    """
     (tgt, dd_pct,
      returns_arr, returns_cols, returns_idx,
      bt_arr, bt_cols, bt_idx,
@@ -158,7 +162,7 @@ def _run_dd_strategy(args):
     dd_val = dd_pct / 100.0
     w = run_optimization(
         returns, tgt, min_w, max_w, group_max, rf,
-        rebalance="daily", dd_constraint=dd_val,
+        rebalance="monthly", dd_constraint=dd_val,
         dd_returns=bt_returns, dd_asset_starts=asset_starts,
     )
     return dd_pct, tgt, w
@@ -204,7 +208,7 @@ def compute_variant(btc_label, exclude_btc, returns_full, asset_starts, ckpt, da
         ]
 
         base_w = {}
-        with Pool(processes=min(n_base, 4)) as pool:
+        with Pool(processes=min(n_base, 4), maxtasksperchild=1) as pool:
             for i, (tgt, w) in enumerate(pool.imap_unordered(_run_base_strategy, args_list), 1):
                 base_w[tgt] = w
                 print(f"    ✓ [{i}/{n_base}] {tgt}")
@@ -247,7 +251,7 @@ def compute_variant(btc_label, exclude_btc, returns_full, asset_starts, ckpt, da
 
         n_workers = min(len(remaining_pairs), 6)
         count = done
-        with Pool(processes=n_workers) as pool:
+        with Pool(processes=n_workers, maxtasksperchild=1) as pool:
             for dd_pct, tgt, w in pool.imap_unordered(_run_dd_strategy, args_list):
                 dd_w.setdefault(dd_pct, {})[tgt] = w
                 count += 1
@@ -337,7 +341,7 @@ def compute_variant(btc_label, exclude_btc, returns_full, asset_starts, ckpt, da
 
             n_workers = min(len(remaining_regime_levels), 6)
             count = done_r
-            with Pool(processes=n_workers) as pool:
+            with Pool(processes=n_workers, maxtasksperchild=1) as pool:
                 for dd_pct, rw in pool.imap_unordered(_run_regime_dd, args_list):
                     regime_weights_by_dd[dd_pct] = rw
                     count += 1

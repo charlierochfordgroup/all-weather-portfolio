@@ -8,12 +8,25 @@ Supports two modes:
 1. Parametric (legacy): bump_max controls a linear interpolation.
 2. Optimised schedule: per-rank bump factors loaded from optimal_bump_schedule.pkl,
    found via grid search over shape parameters (see optimize_bump.py).
+
+Robustness features:
+- Confidence scaling: bump magnitude scales with sqrt(n_episodes / threshold),
+  so assets with sparse history (e.g. Bitcoin, CNY) receive smaller adjustments.
+- Trend filter: positive bumps are halved for assets trading below their
+  252-day SMA, reducing "catching falling knives" in trending downturns.
 """
 
 import numpy as np
 import pandas as pd
 import pickle
 from pathlib import Path
+
+# Number of drawdown episodes needed for full confidence in the p-value signal.
+# Assets with fewer episodes have their bumps scaled down proportionally.
+_EPISODE_CONFIDENCE_THRESHOLD = 15
+
+# Trading days in 12 months — used for trend filter SMA window.
+_SMA_WINDOW = 252
 
 
 def _cumulative_prices(log_returns: pd.Series) -> pd.Series:
@@ -79,6 +92,31 @@ def compute_pvalue(current_dd: float, episodes: list[dict]) -> float:
     return worse_count / len(episodes)
 
 
+def _episode_confidence(n_episodes: int) -> float:
+    """Return a [0, 1] confidence factor based on number of drawdown episodes.
+
+    Assets with fewer than _EPISODE_CONFIDENCE_THRESHOLD episodes have their
+    bump factors scaled down, reflecting the wider uncertainty in the p-value
+    estimate when the historical sample is small.
+    """
+    if n_episodes <= 0:
+        return 0.0
+    return min(n_episodes / _EPISODE_CONFIDENCE_THRESHOLD, 1.0)
+
+
+def _is_in_downtrend(nz_log_returns: pd.Series) -> bool:
+    """Return True if the asset is trading below its 252-day SMA.
+
+    Uses non-zero log returns to construct the cumulative price series.
+    Returns False when insufficient history exists.
+    """
+    if len(nz_log_returns) < _SMA_WINDOW:
+        return False
+    prices = _cumulative_prices(nz_log_returns)
+    sma = prices.rolling(_SMA_WINDOW).mean().iloc[-1]
+    return bool(prices.iloc[-1] < sma)
+
+
 def compute_dd_adjustments(
     returns: pd.DataFrame,
     checkpoint_dates: list[pd.Timestamp],
@@ -92,6 +130,8 @@ def compute_dd_adjustments(
     - Rank assets by p-value (lowest first)
     - Bump factors scale from +bump_max (rank 0) down to +5% (rank 9),
       then reductions from -5% to -(bump_max * 0.6) for the rest.
+    - Confidence scaling: bump magnitude scaled by min(n_episodes/15, 1.0)
+    - Trend filter: positive bumps halved for assets below 252-day SMA
 
     bump_max: maximum positive bump for the most deeply drawn-down asset
               (default 0.50 = +50%). Configurable via the UI.
@@ -113,6 +153,8 @@ def compute_dd_adjustments(
 
         pvalues = np.ones(n_assets)
         current_dds = np.zeros(n_assets)
+        episode_counts = np.zeros(n_assets, dtype=int)
+        in_downtrend = np.zeros(n_assets, dtype=bool)
 
         for i, col in enumerate(returns.columns):
             asset_rets = r_up_to[col]
@@ -129,7 +171,9 @@ def compute_dd_adjustments(
             current_dd = prices.iloc[-1] / peak_val - 1.0
             current_dds[i] = current_dd
 
+            episode_counts[i] = len(episodes)
             pvalues[i] = compute_pvalue(current_dd, episodes)
+            in_downtrend[i] = _is_in_downtrend(nz)
 
         # Rank by p-value (lowest first = deepest relative drawdown)
         ranks = np.argsort(np.argsort(pvalues))  # rank 0 = lowest p-value
@@ -139,15 +183,23 @@ def compute_dd_adjustments(
             rank = ranks[i]
             if rank < 10:
                 # Top 10 get bumps scaling from bump_max down to ~+5%
-                adj[i] = bump_max - rank * bump_step
+                raw_bump = bump_max - rank * bump_step
             else:
                 # Remaining get reductions scaling from -5% to -reduction_max
                 remaining = n_assets - 10
                 if remaining > 0:
                     pos_in_tail = rank - 10  # 0 to remaining-1
-                    adj[i] = -0.05 - (reduction_max - 0.05) * (pos_in_tail / max(remaining - 1, 1))
+                    raw_bump = -0.05 - (reduction_max - 0.05) * (pos_in_tail / max(remaining - 1, 1))
                 else:
-                    adj[i] = -0.05
+                    raw_bump = -0.05
+
+            # Confidence scaling: dampen bumps for assets with sparse episode history
+            confidence = _episode_confidence(episode_counts[i])
+            adj[i] = raw_bump * confidence
+
+            # Trend filter: halve positive bumps for assets in sustained downtrend
+            if adj[i] > 0 and in_downtrend[i]:
+                adj[i] *= 0.5
 
         adjustments[cp_date] = adj
 
@@ -181,6 +233,10 @@ def compute_dd_adjustments_scheduled(
 
     bump_schedule: array where bump_schedule[rank] gives the adjustment
     for that p-value rank (rank 0 = lowest p-value = deepest DD).
+
+    Robustness:
+    - Confidence scaling applied: bump *= min(n_episodes / 15, 1.0)
+    - Trend filter applied: positive bumps halved when price < 252-day SMA
     """
     n_assets = returns.shape[1]
     adjustments = {}
@@ -192,6 +248,9 @@ def compute_dd_adjustments_scheduled(
             continue
 
         pvalues = np.ones(n_assets)
+        episode_counts = np.zeros(n_assets, dtype=int)
+        in_downtrend = np.zeros(n_assets, dtype=bool)
+
         for i, col in enumerate(returns.columns):
             asset_rets = r_up_to[col]
             nz = asset_rets[asset_rets != 0]
@@ -201,12 +260,22 @@ def compute_dd_adjustments_scheduled(
             episodes = detect_drawdown_episodes(prices, relative_threshold)
             peak_val = prices.cummax().iloc[-1]
             current_dd = prices.iloc[-1] / peak_val - 1.0
+            episode_counts[i] = len(episodes)
             pvalues[i] = compute_pvalue(current_dd, episodes)
+            in_downtrend[i] = _is_in_downtrend(nz)
 
         ranks = np.argsort(np.argsort(pvalues))
         adj = np.zeros(n_assets)
         for i in range(n_assets):
-            adj[i] = bump_schedule[min(ranks[i], len(bump_schedule) - 1)]
+            raw_bump = bump_schedule[min(ranks[i], len(bump_schedule) - 1)]
+
+            # Confidence scaling
+            confidence = _episode_confidence(episode_counts[i])
+            adj[i] = raw_bump * confidence
+
+            # Trend filter: halve positive bumps for assets below 252-day SMA
+            if adj[i] > 0 and in_downtrend[i]:
+                adj[i] *= 0.5
 
         adjustments[cp_date] = adj
 
@@ -279,7 +348,8 @@ def dd_analytics(
 ) -> dict:
     """Compute analytics for the Dynamic Strategies UI tab.
 
-    Returns per-asset data: p-values, current drawdowns, episode counts, bump factors.
+    Returns per-asset data: p-values, current drawdowns, episode counts,
+    bump factors, confidence scores, and trend filter flags.
     """
     n_assets = returns.shape[1]
     r_up_to = returns[returns.index <= as_of_date]
@@ -290,6 +360,8 @@ def dd_analytics(
         "current_dd": np.zeros(n_assets),
         "episode_counts": np.zeros(n_assets, dtype=int),
         "bump_factors": np.zeros(n_assets),
+        "confidence": np.zeros(n_assets),
+        "in_downtrend": np.zeros(n_assets, dtype=bool),
     }
 
     if len(r_up_to) < 20:
@@ -310,21 +382,31 @@ def dd_analytics(
         result["current_dd"][i] = current_dd
         result["episode_counts"][i] = len(episodes)
         result["pvalues"][i] = compute_pvalue(current_dd, episodes)
+        result["confidence"][i] = _episode_confidence(len(episodes))
+        result["in_downtrend"][i] = _is_in_downtrend(nz)
 
-    # Rank and assign bumps (configurable via bump_max)
+    # Rank and assign bumps (configurable via bump_max), with robustness filters
     bump_step = (bump_max - 0.05) / max(9, 1)
     reduction_max = bump_max * 0.6
     ranks = np.argsort(np.argsort(result["pvalues"]))
     for i in range(n_assets):
         rank = ranks[i]
         if rank < 10:
-            result["bump_factors"][i] = bump_max - rank * bump_step
+            raw_bump = bump_max - rank * bump_step
         else:
             remaining = n_assets - 10
             if remaining > 0:
                 pos_in_tail = rank - 10
-                result["bump_factors"][i] = -0.05 - (reduction_max - 0.05) * (pos_in_tail / max(remaining - 1, 1))
+                raw_bump = -0.05 - (reduction_max - 0.05) * (pos_in_tail / max(remaining - 1, 1))
             else:
-                result["bump_factors"][i] = -0.05
+                raw_bump = -0.05
+
+        # Confidence scaling
+        bump = raw_bump * result["confidence"][i]
+        # Trend filter
+        if bump > 0 and result["in_downtrend"][i]:
+            bump *= 0.5
+
+        result["bump_factors"][i] = bump
 
     return result
