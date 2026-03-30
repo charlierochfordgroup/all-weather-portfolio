@@ -8,7 +8,7 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 from data import ASSETS, GROUP_MAP, GROUP_NAMES
-from stats import calc_stats, TD
+from stats import calc_stats, calc_stats_cached, StatsCache, TD
 
 
 def _group_indices() -> dict[str, list[int]]:
@@ -127,15 +127,45 @@ def _objective(
         if dd_excess > 0:
             dd_penalty = 100.0 * dd_excess  # heavy penalty
 
-    if target in ("Max Sharpe Ratio", "Max Sharpe (DD \u2264 X%)"):
+    return _score(s, target, risk_free_rate, dd_penalty, leverage, financing_rate,
+                  dd_returns, dd_asset_starts, rebalance, w)
+
+
+def _objective_cached(
+    w: np.ndarray,
+    opt_cache: StatsCache,
+    dd_cache: StatsCache | None,
+    target: str,
+    risk_free_rate: float,
+    dd_constraint: float | None = None,
+    leverage: float = 1.0,
+    financing_rate: float = 0.065,
+) -> float:
+    """Fast objective using pre-computed StatsCache (avoids redundant work)."""
+    s = calc_stats_cached(opt_cache, w, risk_free_rate)
+
+    dd_penalty = 0.0
+    if dd_constraint is not None:
+        s_dd = calc_stats_cached(dd_cache, w, risk_free_rate) if dd_cache is not None else s
+        dd_excess = abs(s_dd.max_drawdown) - dd_constraint
+        if dd_excess > 0:
+            dd_penalty = 100.0 * dd_excess
+
+    return _score(s, target, risk_free_rate, dd_penalty, leverage, financing_rate)
+
+
+def _score(s, target, risk_free_rate, dd_penalty,
+           leverage=1.0, financing_rate=0.065,
+           dd_returns=None, dd_asset_starts=None, rebalance="daily", w=None):
+    """Compute objective score from PortfolioStats — shared by both objective paths."""
+    if target in ("Max Sharpe Ratio", "Max Sharpe (DD ≤ X%)"):
         return -s.sharpe + dd_penalty
     elif target == "Min Volatility":
         return s.volatility + dd_penalty
-    elif target in ("Max Calmar Ratio", "Max Calmar (DD \u2264 X%)"):
+    elif target in ("Max Calmar Ratio", "Max Calmar (DD ≤ X%)"):
         return -s.calmar + dd_penalty
     elif target == "Minimize Max Drawdown":
-        # If extended backtest data is provided, evaluate DD on the full period
-        if dd_returns is not None:
+        if dd_returns is not None and w is not None:
             s_dd = calc_stats(dd_returns, w, risk_free_rate, rebalance=rebalance,
                               asset_starts=dd_asset_starts)
             return abs(s_dd.max_drawdown) + s_dd.longest_dd * 5e-5
@@ -143,8 +173,6 @@ def _objective(
     elif target == "Leverage-Optimal":
         L = leverage
         vol = s.volatility
-        # Post-leverage CAGR: exact geometric form (consistent with cfd.py),
-        # minus financing on the borrowed portion (L-1)x.
         post_lev_cagr = ((1.0 + s.cagr) ** L
                          * np.exp(-0.5 * L * (L - 1) * vol**2)
                          - 1.0
@@ -188,6 +216,19 @@ def optimize_portfolio(
 
     bounds = list(zip(min_w, max_w))
 
+    # ── Build pre-computed caches for fast objective evaluation ──
+    opt_cache = StatsCache.build(returns, rebalance, asset_starts=None)
+    dd_cache = None
+    if dd_constraint is not None and dd_returns is not None:
+        dd_cache = StatsCache.build(dd_returns, rebalance, asset_starts=dd_asset_starts)
+    elif dd_constraint is not None:
+        dd_cache = opt_cache  # evaluate DD on the same period
+
+    def obj_cached(w):
+        return _objective_cached(w, opt_cache, dd_cache, target, risk_free_rate,
+                                 dd_constraint, leverage, financing_rate)
+
+    # Legacy uncached objective (for _optimize_drawdown which uses differential_evolution)
     def obj(w):
         return _objective(w, returns, target, risk_free_rate, rebalance,
                           dd_constraint, dd_returns, dd_asset_starts,
@@ -202,7 +243,44 @@ def optimize_portfolio(
             current_weights, rebalance, constraints, bounds, obj,
         )
 
-    # ── Standard SLSQP multi-start approach for smooth objectives ──
+    # ── Two-phase warm-start for periodic rebalancing with DD constraints ──
+    # Phase 1: solve with daily rebalancing (very fast, ~0.1ms/eval).
+    # Phase 2: polish with the target rebalancing from that starting point.
+    # Risk mitigation: if the polished result is worse than a full search
+    # from standard starts, we keep the better result.
+    daily_warm_start = None
+    if rebalance != "daily" and dd_constraint is not None and current_weights is None:
+        # Phase 1: fast daily solve
+        daily_opt_cache = StatsCache.build(returns, "daily", asset_starts=None)
+        daily_dd_cache = None
+        if dd_returns is not None:
+            daily_dd_cache = StatsCache.build(dd_returns, "daily", asset_starts=dd_asset_starts)
+        else:
+            daily_dd_cache = daily_opt_cache
+
+        def obj_daily(w):
+            return _objective_cached(w, daily_opt_cache, daily_dd_cache, target,
+                                     risk_free_rate, dd_constraint, leverage, financing_rate)
+
+        daily_starts = _build_starts(returns, min_w, max_w, group_max, None, target)
+        daily_best_w, daily_best_val = None, np.inf
+        for w0 in daily_starts:
+            w0 = clip_normalize(w0, min_w, max_w, group_max)
+            try:
+                result = minimize(
+                    obj_daily, w0, method="SLSQP", bounds=bounds,
+                    constraints=constraints,
+                    options={"maxiter": 300, "ftol": 1e-8},
+                )
+                if result.fun < daily_best_val:
+                    daily_best_val = result.fun
+                    daily_best_w = result.x
+            except Exception:
+                continue
+        if daily_best_w is not None:
+            daily_warm_start = clip_normalize(daily_best_w, min_w, max_w, group_max)
+
+    # ── Standard SLSQP multi-start approach ──
     best_w = None
     best_val = np.inf
 
@@ -213,6 +291,10 @@ def optimize_portfolio(
     if current_weights is not None and dd_constraint is not None:
         starts = starts[:2]  # warm start + inverse-vol only
         max_iter = 150
+    elif daily_warm_start is not None:
+        # Two-phase: use daily solution as primary start, keep inv-vol as backup
+        starts = [daily_warm_start] + starts[:2]
+        max_iter = 200  # fewer iterations needed — already near optimal
     else:
         max_iter = 300
 
@@ -220,7 +302,7 @@ def optimize_portfolio(
         w0 = clip_normalize(w0, min_w, max_w, group_max)
         try:
             result = minimize(
-                obj, w0, method="SLSQP", bounds=bounds,
+                obj_cached, w0, method="SLSQP", bounds=bounds,
                 constraints=constraints,
                 options={"maxiter": max_iter, "ftol": 1e-8},
             )
