@@ -76,6 +76,8 @@ CHECKPOINT_FILE = _DIR / "_precompute_checkpoint.pkl"
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
+DD_OPT_REBALANCE = "monthly"  # rebalancing used when evaluating DD constraints in optimisation
+
 def _params_hash(returns_df):
     """Hash input data + key parameters. If this matches the checkpoint, skip."""
     h = hashlib.md5()
@@ -84,6 +86,7 @@ def _params_hash(returns_df):
         h.update(str(val).encode())
     h.update(str(sorted(BASE_TARGETS + DD_TARGETS)).encode())
     h.update(str(sorted(DD_LEVELS)).encode())
+    h.update(DD_OPT_REBALANCE.encode())  # include rebalancing mode so hash changes when it does
     return h.hexdigest()
 
 
@@ -162,7 +165,7 @@ def _run_dd_strategy(args):
     dd_val = dd_pct / 100.0
     w = run_optimization(
         returns, tgt, min_w, max_w, group_max, rf,
-        rebalance="monthly", dd_constraint=dd_val,
+        rebalance=DD_OPT_REBALANCE, dd_constraint=dd_val,
         dd_returns=bt_returns, dd_asset_starts=asset_starts,
     )
     return dd_pct, tgt, w
