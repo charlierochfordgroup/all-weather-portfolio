@@ -323,7 +323,9 @@ def _periodic_rebal_returns_vectorized(
         denom = wG.sum(axis=1)  # (seg_len,)
         numer = (wG * chunk).sum(axis=1)  # (seg_len,)
 
-        port[s:e] = numer / denom
+        # Guard against zero denominator (all-zero weights or extreme optimizer proposals)
+        safe_denom = np.where(np.abs(denom) > 1e-12, denom, 1.0)
+        port[s:e] = numer / safe_denom
 
     return port
 
