@@ -9,6 +9,7 @@ from scipy.spatial.distance import squareform
 
 from data import ASSETS, GROUP_MAP, GROUP_NAMES
 from stats import calc_stats, calc_stats_cached, StatsCache, TD
+from cfd import portfolio_dividend_drag
 
 
 def _group_indices() -> dict[str, list[int]]:
@@ -151,7 +152,8 @@ def _objective_cached(
         if dd_excess > 0:
             dd_penalty = 100.0 * dd_excess
 
-    return _score(s, target, risk_free_rate, dd_penalty, leverage, financing_rate)
+    return _score(s, target, risk_free_rate, dd_penalty, leverage, financing_rate,
+                  w=w)
 
 
 def _score(s, target, risk_free_rate, dd_penalty,
@@ -173,10 +175,17 @@ def _score(s, target, risk_free_rate, dd_penalty,
     elif target == "Leverage-Optimal":
         L = leverage
         vol = s.volatility
-        post_lev_cagr = ((1.0 + s.cagr) ** L
+        # Subtract dividend tax drag before leveraging (consistent with cfd.py).
+        # CFD dividend adjustments are taxed as income; the total-return index
+        # assumes gross reinvestment, so we apply the shortfall pre-leverage.
+        div_drag = portfolio_dividend_drag(w) if w is not None else 0.0
+        adjusted_cagr = s.cagr - div_drag
+        # CMC Markets charges financing on FULL notional (not just borrowed portion).
+        # financing_drag = financing_rate × L (per unit of deployed capital).
+        post_lev_cagr = ((1.0 + adjusted_cagr) ** L
                          * np.exp(-0.5 * L * (L - 1) * vol**2)
                          - 1.0
-                         - financing_rate * (L - 1))
+                         - financing_rate * L)
         post_lev_vol = vol * L
         if post_lev_vol > 1e-4:
             post_lev_sharpe = (post_lev_cagr - risk_free_rate) / post_lev_vol
@@ -420,11 +429,12 @@ def _optimize_drawdown(
 
     # Add defensive starts: max-bond and max-cash-bond blends
     # These are the most likely to have very low drawdowns.
+    n_bonds = sum(1 for a in ASSETS if GROUP_MAP[a] == "Bonds")
     for bond_frac in [0.4, 0.6, 0.8]:
         w_bond = np.full(n, (1.0 - bond_frac) / n)
         for i, a in enumerate(ASSETS):
             if GROUP_MAP[a] == "Bonds":
-                w_bond[i] = bond_frac / 3.0  # split across 3 bond assets
+                w_bond[i] = bond_frac / max(n_bonds, 1)
         w_bond = clip_normalize(w_bond, min_w, max_w, group_max)
         vol_candidates.append(w_bond)
 
