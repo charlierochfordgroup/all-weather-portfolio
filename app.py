@@ -1149,6 +1149,7 @@ with tab_compare:
             hovermode="x unified",
             template="plotly_white",
             height=450,
+            margin=dict(l=70, r=20, t=50, b=50),
             yaxis=dict(
                 tickmode="array",
                 tickvals=_eq_ticks,
@@ -1855,15 +1856,24 @@ with tab_cfd:
             )
 
             st.subheader("Daily Financing Cost Calculator")
+            st.caption(
+                "Quick what-if calculator. Pre-filled with this portfolio's notional "
+                f"(${cfd_result.notional_exposure:,.0f}) and the financing rate above "
+                f"({cfd_financing*100:.1f}%) — adjust to model any position."
+            )
             _calc_cols = st.columns(3)
             with _calc_cols[0]:
                 _calc_notional = st.number_input(
-                    "Notional Position Value ($)", value=50000, min_value=0, step=1000,
+                    "Notional Position Value ($)",
+                    value=int(round(cfd_result.notional_exposure)),
+                    min_value=0, step=1000,
                     key="fin_calc_notional",
                 )
             with _calc_cols[1]:
                 _calc_rate = st.number_input(
-                    "Annual Financing Rate (%)", value=7.0, min_value=0.0, max_value=20.0,
+                    "Annual Financing Rate (%)",
+                    value=float(cfd_financing * 100),
+                    min_value=0.0, max_value=20.0,
                     step=0.1, format="%.1f", key="fin_calc_rate",
                 )
             with _calc_cols[2]:

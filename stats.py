@@ -1,10 +1,21 @@
 """Portfolio statistics calculations."""
 
+import warnings
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
 
 TD = 252  # trading days per year
+
+
+def _validate_weights(weights: np.ndarray) -> None:
+    """Warn if weights contain negative values (long-only assumption)."""
+    if np.any(weights < -1e-8):
+        warnings.warn(
+            f"calc_stats received negative weights (min={weights.min():.4f}). "
+            f"All Weather assumes long-only allocations; results may be meaningless.",
+            stacklevel=3,
+        )
 
 
 def compute_asset_starts(returns: pd.DataFrame) -> dict[str, pd.Timestamp]:
@@ -138,6 +149,7 @@ def calc_stats_cached(
     period-label computation, and effective-weight calculation on
     every call. Use inside optimizer loops where only weights change.
     """
+    _validate_weights(weights)
     n_days = cache.n_days
     if n_days == 0:
         return PortfolioStats()
@@ -154,28 +166,11 @@ def calc_stats_cached(
         eff_w = eff / row_sums
 
     if cache.rebalance != "daily":
-        _has_cash = weights.sum() < 1.0 - 1e-8
-        if not _has_cash:
-            port_simple = _periodic_rebal_returns_vectorized(
-                cache.simple_rets, weights, cache.segs, eff_w,
-            )
-        else:
-            # Rare: fall back — reconstruct DataFrame for slow path
-            # This shouldn't happen in the optimizer (weights always sum to 1)
-            port_simple = np.empty(n_days)
-            cur_w = weights.copy()
-            for i in range(len(cache.segs) - 1):
-                s, e = cache.segs[i], cache.segs[i + 1]
-                w_start = eff_w[s] if eff_w is not None else weights
-                cur_w = w_start.copy()
-                _target_sum = cur_w.sum()
-                for t in range(s, e):
-                    sr = cache.simple_rets[t]
-                    port_simple[t] = cur_w @ sr
-                    grown = cur_w * (1.0 + sr)
-                    total = grown.sum()
-                    if total > 1e-12:
-                        cur_w = grown * (_target_sum / total)
+        # The optimizer always passes weights that sum to 1 (cash allocation
+        # would use the full calc_stats slow path, not this cached version).
+        port_simple = _periodic_rebal_returns_vectorized(
+            cache.simple_rets, weights, cache.segs, eff_w,
+        )
     else:
         if eff_w is not None:
             port_simple = np.sum(cache.simple_rets * eff_w, axis=1)
@@ -449,6 +444,7 @@ def calc_stats(
     weights_schedule: when provided, target weights change over time. Forces
                       periodic rebalancing (falls back to "monthly" if "daily").
     """
+    _validate_weights(weights)
     if start_date is not None:
         returns = returns[returns.index >= start_date]
     if end_date is not None:
