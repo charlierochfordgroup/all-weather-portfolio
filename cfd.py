@@ -42,6 +42,41 @@ ASSET_DIVIDEND_YIELDS = {
 
 CFD_DIVIDEND_TAX_RATE = 0.18  # marginal tax rate applied to dividend adjustments
 
+# Per-asset margin requirement as a fraction of notional.
+# CMC Markets charges different margin rates by product type:
+#   - Index / equity / bond / commodity CFDs: 20%
+#   - FX CFDs (currency pairs): 5%
+#   - Crypto CFDs (Bitcoin): 50%
+#   - Cash is not a CFD position: 0%
+ASSET_MARGIN_RATES = {
+    "Cash":                 0.00,
+    "Nasdaq":               0.20,
+    "S&P 500":              0.20,
+    "Russell 2000":         0.20,
+    "ASX200":               0.20,
+    "Emerging Markets":     0.20,
+    "Corporate Bonds":      0.20,
+    "Long-Term Treasuries": 0.20,
+    "Short-Term Treasuries":0.20,
+    "US REITs":             0.20,
+    "Industrial Metals":    0.20,
+    "Gold":                 0.20,
+    "Bitcoin":              0.50,
+    "Infrastructure":       0.20,
+    "Japan Equities":       0.20,
+    "UK Equities":          0.20,
+    "EU Equities":          0.20,
+    "US TIPS":              0.20,
+    "High Yield":           0.20,
+    "EM Debt":              0.20,
+    "JPY":                  0.05,
+    "CHF":                  0.05,
+    "CNY":                  0.05,
+    "China Equities":       0.20,
+    "Copper":               0.20,
+    "Soft Commodities":     0.20,
+}
+
 
 def portfolio_dividend_drag(weights: np.ndarray, tax_rate: float = CFD_DIVIDEND_TAX_RATE) -> float:
     """Return the annual CAGR drag from taxed dividend adjustments (unleveraged).
@@ -55,6 +90,21 @@ def portfolio_dividend_drag(weights: np.ndarray, tax_rate: float = CFD_DIVIDEND_
     return total_yield * tax_rate
 
 
+def portfolio_weighted_margin(
+    weights: np.ndarray,
+    margin_rates: dict[str, float] | None = None,
+) -> float:
+    """Return the portfolio-weighted margin rate: sum(|w_i| * m_i).
+
+    Uses absolute weights because margin is required on both long and short.
+    """
+    rates = margin_rates or ASSET_MARGIN_RATES
+    return sum(
+        abs(weights[i]) * rates.get(asset, 0.20)
+        for i, asset in enumerate(ASSETS)
+    )
+
+
 @dataclass
 class CFDAnalysis:
     """Results of CFD leverage analysis."""
@@ -64,6 +114,7 @@ class CFDAnalysis:
     deployed_capital: float           # capital actually deployed (total - reserve)
     notional_exposure: float          # total leveraged position size
     capital_per_asset: dict[str, float]  # notional $ per asset
+    margin_per_asset: dict[str, float]   # margin $ required per asset
     margin_required: float            # total margin needed
     free_margin: float                # deployed capital minus margin
 
@@ -89,8 +140,8 @@ def analyze_cfd(
     total_capital: float,
     leverage_ratio: float,
     financing_rate: float,
-    margin_requirement: float,
-    risk_free_rate: float,
+    margin_rates: dict[str, float] | None = None,
+    risk_free_rate: float = 0.04,
 ) -> CFDAnalysis:
     """Analyse a portfolio under CFD leverage.
 
@@ -101,26 +152,32 @@ def analyze_cfd(
     total_capital : total capital available (some will be held as cash reserve)
     leverage_ratio : e.g. 5.0 for 5x leverage
     financing_rate : annual interest charged on borrowed notional (e.g. 0.06)
-    margin_requirement : fraction of notional required as margin (e.g. 0.20)
+    margin_rates : per-asset margin rates dict, or None to use ASSET_MARGIN_RATES
     risk_free_rate : for Sharpe calculation
     """
+    rates = margin_rates or ASSET_MARGIN_RATES
+
+    # Portfolio-weighted margin rate: reflects the actual margin needed
+    # given this portfolio's allocation across different asset classes.
+    weighted_margin = portfolio_weighted_margin(weights, rates)
+
     # Figure out how much capital to deploy vs hold as cash reserve.
     # The cash reserve covers the worst-case leveraged drawdown so that
     # a margin call is avoided.
     #
     # Let D = deployed, R = reserve, T = total = D + R
     # Notional = D * leverage
-    # Margin = Notional * margin_req = D * leverage * margin_req
-    # Free margin = D - Margin = D * (1 - leverage * margin_req)
+    # Margin = D * leverage * weighted_margin  (portfolio-weighted)
+    # Free margin = D - Margin = D * (1 - leverage * weighted_margin)
     # Max DD$ = abs(max_dd) * leverage * D
     # Reserve needed = Max DD$ - Free margin
-    #   = D * (abs(max_dd)*leverage - 1 + leverage*margin_req)
-    #   = D * k   where k = abs(max_dd)*leverage - 1 + leverage*margin_req
+    #   = D * (abs(max_dd)*leverage - 1 + leverage*weighted_margin)
+    #   = D * k   where k = abs(max_dd)*leverage - 1 + leverage*weighted_margin
     # Since D + R = T and R = D*k:
     #   D(1 + k) = T  =>  D = T / (1 + k)
 
     abs_dd = abs(stats.max_drawdown)
-    k = abs_dd * leverage_ratio - 1.0 + leverage_ratio * margin_requirement
+    k = abs_dd * leverage_ratio - 1.0 + leverage_ratio * weighted_margin
     if k > 0:
         deployed_capital = total_capital / (1.0 + k)
         cash_reserve = total_capital - deployed_capital
@@ -129,13 +186,19 @@ def analyze_cfd(
         cash_reserve = 0.0
 
     notional = deployed_capital * leverage_ratio
-    margin_req = notional * margin_requirement
-    free_margin = max(deployed_capital - margin_req, 0.0)
 
-    # Per-asset notional
+    # Per-asset notional and per-asset margin
     capital_per_asset = {}
+    margin_per_asset_dict = {}
+    margin_req = 0.0
     for i, asset in enumerate(ASSETS):
+        asset_notional = abs(weights[i]) * notional
         capital_per_asset[asset] = weights[i] * notional
+        asset_margin = asset_notional * rates.get(asset, 0.20)
+        margin_per_asset_dict[asset] = asset_margin
+        margin_req += asset_margin
+
+    free_margin = max(deployed_capital - margin_req, 0.0)
 
     # Dividend drag (unleveraged): reduce base CAGR before leveraging.
     # Dividend adjustments are taxed as ordinary income; the total-return
@@ -188,6 +251,7 @@ def analyze_cfd(
         deployed_capital=deployed_capital,
         notional_exposure=notional,
         capital_per_asset=capital_per_asset,
+        margin_per_asset=margin_per_asset_dict,
         margin_required=margin_req,
         free_margin=free_margin,
         max_drawdown_dollars=max_dd_dollars,

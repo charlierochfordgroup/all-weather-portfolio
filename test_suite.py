@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from datetime import datetime
+from data import ASSETS
 
 # ---------------------------------------------------------------------------
 # Helpers to create synthetic data
@@ -330,7 +331,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=3.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         assert result.total_capital == 100_000
@@ -346,7 +347,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=5.0,
-            financing_rate=0.06, margin_requirement=0.10,
+            financing_rate=0.06, margin_rates={a: 0.10 for a in ASSETS},
             risk_free_rate=0.04,
         )
         assert abs(result.notional_exposure - result.deployed_capital * 5.0) < 0.01
@@ -358,7 +359,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=3.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         # CMC charges financing on full notional: drag = rate * leverage
@@ -372,7 +373,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=3.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         # Correct leveraged CAGR: adjust for dividend drag first, then leverage
@@ -391,7 +392,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=3.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         # CMC charges financing on full notional: drag = rate * leverage
@@ -405,7 +406,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=1.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         # At 1x leverage, CMC still charges financing on full notional:
@@ -421,7 +422,7 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=3.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         total_allocated = sum(result.capital_per_asset.values())
@@ -434,11 +435,79 @@ class TestCFD:
         result = analyze_cfd(
             weights=w, stats=stats,
             total_capital=100_000, leverage_ratio=3.0,
-            financing_rate=0.06, margin_requirement=0.20,
+            financing_rate=0.06, margin_rates={a: 0.20 for a in ASSETS},
             risk_free_rate=0.04,
         )
         expected_util = result.margin_required / result.deployed_capital
         assert abs(result.margin_utilisation - expected_util) < 1e-6
+
+    def test_per_asset_margin_weighted(self):
+        """Portfolio-weighted margin should reflect per-asset rates."""
+        from cfd import analyze_cfd, portfolio_weighted_margin, ASSET_MARGIN_RATES
+        w = _equal_weights()
+        stats = self._make_stats()
+        result = analyze_cfd(
+            weights=w, stats=stats,
+            total_capital=100_000, leverage_ratio=3.0,
+            financing_rate=0.06, risk_free_rate=0.04,
+        )
+        # Weighted margin for equal weights = mean of all asset margin rates
+        expected_wm = portfolio_weighted_margin(w)
+        actual_wm = sum(result.margin_per_asset.values()) / result.notional_exposure
+        assert abs(actual_wm - expected_wm) < 1e-6
+
+    def test_margin_per_asset_sums_to_total(self):
+        """Sum of per-asset margins should equal total margin_required."""
+        from cfd import analyze_cfd
+        w = _equal_weights()
+        stats = self._make_stats()
+        result = analyze_cfd(
+            weights=w, stats=stats,
+            total_capital=100_000, leverage_ratio=5.0,
+            financing_rate=0.06, risk_free_rate=0.04,
+        )
+        assert abs(sum(result.margin_per_asset.values()) - result.margin_required) < 0.01
+
+    def test_cash_zero_margin(self):
+        """A 100% Cash portfolio should have zero margin required."""
+        from cfd import analyze_cfd
+        w = np.zeros(len(ASSETS))
+        w[ASSETS.index("Cash")] = 1.0
+        stats = self._make_stats()
+        result = analyze_cfd(
+            weights=w, stats=stats,
+            total_capital=100_000, leverage_ratio=3.0,
+            financing_rate=0.06, risk_free_rate=0.04,
+        )
+        assert result.margin_required < 0.01
+
+    def test_currency_margin_5pct(self):
+        """A 100% JPY portfolio should have 5% margin rate."""
+        from cfd import analyze_cfd
+        w = np.zeros(len(ASSETS))
+        w[ASSETS.index("JPY")] = 1.0
+        stats = self._make_stats()
+        result = analyze_cfd(
+            weights=w, stats=stats,
+            total_capital=100_000, leverage_ratio=3.0,
+            financing_rate=0.06, risk_free_rate=0.04,
+        )
+        expected_margin = result.notional_exposure * 0.05
+        assert abs(result.margin_required - expected_margin) < 0.01
+
+    def test_bitcoin_margin_50pct(self):
+        """A 100% Bitcoin portfolio should have 50% margin rate."""
+        from cfd import analyze_cfd
+        w = np.zeros(len(ASSETS))
+        w[ASSETS.index("Bitcoin")] = 1.0
+        stats = self._make_stats()
+        result = analyze_cfd(
+            weights=w, stats=stats,
+            total_capital=100_000, leverage_ratio=3.0,
+            financing_rate=0.06, risk_free_rate=0.04,
+        )
+        expected_margin = result.notional_exposure * 0.50
+        assert abs(result.margin_required - expected_margin) < 0.01
 
 
 # ===========================================================================
@@ -456,7 +525,7 @@ class TestIntegration:
         result = analyze_cfd(
             weights=w, stats=s,
             total_capital=100_000, leverage_ratio=2.0,
-            financing_rate=0.05, margin_requirement=0.10,
+            financing_rate=0.05, margin_rates={a: 0.10 for a in ASSETS},
             risk_free_rate=0.04,
         )
         assert np.isfinite(result.net_cagr)
@@ -834,7 +903,8 @@ class TestAuditCFDConsistency:
                            best_year=0.20, worst_year=-0.10,
                            pct_positive=0.53, longest_dd=50)
         w = _equal_weights()
-        result = analyze_cfd(w, s, 100000, 1.0, 0.06, 0.20, 0.04)
+        _uniform_20 = {a: 0.20 for a in ASSETS}
+        result = analyze_cfd(w, s, 100000, 1.0, 0.06, margin_rates=_uniform_20, risk_free_rate=0.04)
         # At 1x, gross_cagr = cagr - unleveraged dividend drag (vol drag term = 0)
         div_drag_ul = portfolio_dividend_drag(w)
         assert abs(result.gross_cagr - (s.cagr - div_drag_ul)) < 1e-10
@@ -852,7 +922,8 @@ class TestAuditCFDConsistency:
                            best_year=0.0, worst_year=0.0,
                            pct_positive=0.0, longest_dd=0)
         w = _equal_weights()
-        result = analyze_cfd(w, s, 100000, 10.0, 0.06, 0.10, 0.04)
+        _uniform_10 = {a: 0.10 for a in ASSETS}
+        result = analyze_cfd(w, s, 100000, 10.0, 0.06, margin_rates=_uniform_10, risk_free_rate=0.04)
         # At 10x leverage with 30% vol, vol drag should destroy returns
         # exp(-10*9*0.30^2/2) = exp(-4.05) ≈ 0.017
         # (1.08)^10 * 0.017 - 1 ≈ -0.96
@@ -867,7 +938,8 @@ class TestAuditCFDConsistency:
                            best_year=0.15, worst_year=-0.10,
                            pct_positive=0.53, longest_dd=60)
         w = _equal_weights()
-        result = analyze_cfd(w, s, 100000, 5.0, 0.06, 0.20, 0.04)
+        _uniform_20 = {a: 0.20 for a in ASSETS}
+        result = analyze_cfd(w, s, 100000, 5.0, 0.06, margin_rates=_uniform_20, risk_free_rate=0.04)
         # Worst-case loss = |max_dd| * leverage * deployed
         max_loss = abs(s.max_drawdown) * 5.0 * result.deployed_capital
         # Free margin + reserve should cover the loss
@@ -1074,7 +1146,8 @@ class TestDividendDragConsistency:
 
         drags = []
         for lev in [1.0, 2.0, 3.0, 5.0]:
-            result = analyze_cfd(w, s, 100000, lev, 0.06, 0.20, 0.04)
+            _uniform_20 = {a: 0.20 for a in ASSETS}
+            result = analyze_cfd(w, s, 100000, lev, 0.06, margin_rates=_uniform_20, risk_free_rate=0.04)
             drags.append(result.dividend_drag)
 
         # Dividend drag should be monotonically increasing with leverage
@@ -1109,7 +1182,8 @@ class TestDividendDragConsistency:
                            pct_positive=0.53, longest_dd=50)
         L = 3.0
         vol = s.volatility
-        result = analyze_cfd(w, s, 100000, L, 0.06, 0.20, 0.04)
+        _uniform_20 = {a: 0.20 for a in ASSETS}
+        result = analyze_cfd(w, s, 100000, L, 0.06, margin_rates=_uniform_20, risk_free_rate=0.04)
 
         # Manual: gross without drag minus gross with drag
         div_ul = portfolio_dividend_drag(w)

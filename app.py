@@ -30,7 +30,7 @@ from stats import (
     compute_annual_returns, compute_asset_starts,
 )
 from optimizer import run_optimization
-from cfd import analyze_cfd
+from cfd import analyze_cfd, ASSET_MARGIN_RATES
 from regime import load_regime_data, classify_regimes, optimize_per_regime, build_regime_schedule, regime_analytics, REGIME_LABELS
 from dd_momentum import (
     compute_dd_adjustments, compute_dd_adjustments_scheduled,
@@ -1703,7 +1703,7 @@ with tab_cfd:
     if not portfolio_names:
         st.info("Computing default portfolios...")
     else:
-        cfd_pick_cols = st.columns([2, 1, 1, 1, 1])
+        cfd_pick_cols = st.columns([2, 1, 1, 1])
         with cfd_pick_cols[0]:
             cfd_port_name = st.selectbox("Analyse Portfolio", portfolio_names, key="cfd_port_pick")
         with cfd_pick_cols[1]:
@@ -1713,9 +1713,6 @@ with tab_cfd:
         with cfd_pick_cols[3]:
             cfd_fin_pct = st.number_input("Financing Rate (%)", value=6.5, min_value=0.0, max_value=20.0, step=0.5, format="%.1f", key="cfd_financing")
             cfd_financing = cfd_fin_pct / 100.0
-        with cfd_pick_cols[4]:
-            cfd_margin_pct_input = st.number_input("Margin Req. (%)", value=20.0, min_value=1.0, max_value=100.0, step=1.0, format="%.0f", key="cfd_margin_pct")
-            cfd_margin_pct = cfd_margin_pct_input / 100.0
 
         cfd_port = st.session_state.portfolios[cfd_port_name]
         cfd_weights = cfd_port["weights"]
@@ -1723,7 +1720,7 @@ with tab_cfd:
 
         cfd_result = analyze_cfd(
             cfd_weights, cfd_stats, cfd_capital, cfd_leverage,
-            cfd_financing, cfd_margin_pct, risk_free_rate,
+            cfd_financing, risk_free_rate=risk_free_rate,
         )
 
         # Capital allocation banner
@@ -1793,7 +1790,8 @@ with tab_cfd:
                     "Asset": asset,
                     "Weight": w_pct * 100,
                     "Notional": round(notional_asset),
-                    "Margin": round(notional_asset * cfd_margin_pct),
+                    "Margin %": ASSET_MARGIN_RATES.get(asset, 0.20) * 100,
+                    "Margin ($)": round(cfd_result.margin_per_asset.get(asset, 0.0)),
                 })
         cfd_alloc_df = pd.DataFrame(cfd_alloc_rows)
         st.dataframe(
@@ -1802,7 +1800,8 @@ with tab_cfd:
                 "Asset": st.column_config.TextColumn("Asset"),
                 "Weight": st.column_config.NumberColumn("Weight", format="%.2f%%"),
                 "Notional": st.column_config.NumberColumn("Notional ($)", format="$%.0f"),
-                "Margin": st.column_config.NumberColumn("Margin ($)", format="$%.0f"),
+                "Margin %": st.column_config.NumberColumn("Margin %", format="%.0f%%"),
+                "Margin ($)": st.column_config.NumberColumn("Margin ($)", format="$%.0f"),
             },
             width="stretch",
             hide_index=True,
@@ -2077,7 +2076,7 @@ with tab_cfd:
             # Leveraged: compute CFD metrics for this portfolio
             p_cfd = analyze_cfd(
                 p_weights, p_stats, cfd_capital, cfd_leverage,
-                cfd_financing, cfd_margin_pct, risk_free_rate,
+                cfd_financing, risk_free_rate=risk_free_rate,
             )
             lev_median_10y = _mc_median_10y(
                 p_cfd.deployed_capital, p_cfd.net_cagr, p_cfd.leveraged_volatility,
