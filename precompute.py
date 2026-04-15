@@ -65,7 +65,7 @@ BASE_TARGETS = [
     "Max Sharpe (Unconstrained)",
     "Leverage-Optimal (Unconstrained)",
 ]
-DD_TARGETS = ["Max Sharpe (DD \u2264 X%)"]
+DD_TARGETS = ["Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)"]
 DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 
 _DIR = Path(__file__).resolve().parent
