@@ -180,7 +180,7 @@ _BASE_TARGETS = [
 ]
 
 # DD-constrained targets (computed for each DD level)
-_DD_TARGETS = ["Max Sharpe (DD \u2264 X%)"]
+_DD_TARGETS = ["Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)"]
 
 # Slice returns to date range
 start_ts = pd.Timestamp(start_date)
