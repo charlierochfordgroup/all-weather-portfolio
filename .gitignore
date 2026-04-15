@@ -4,3 +4,8 @@ __pycache__/
 .claude/
 *.tmp
 settings.local.json
+
+# Local data artifacts
+_precompute_checkpoint.pkl
+*_backup.xlsx
+precompute_log.txt
