@@ -1,9 +1,5 @@
 # Future Enhancements
 
-## Time-Varying Strategy Variants
-- [ ] Max Sharpe (Time-Varying) — re-optimises annually using a rolling window, same framework as regime-based and DD p-value
-- [ ] Leverage-Optimal (Time-Varying) — re-optimises the post-leverage Sharpe objective annually, adapting to changing vol/correlation regimes
-
 ## Performance / UX
 - [ ] Create a simplified "fast mode" version that only runs 3-4 core portfolios for quicker iteration
 - [ ] When building simplified portfolio, remove any asset with ≤0.5% allocation to create a super simplified version
@@ -21,3 +17,10 @@
 - [x] Check which assets are available as CFDs on CMC Markets
 - [x] Apply ~18% dividend/coupon haircut to total return indices for CFD tax drag (CFD tab only)
 - [x] Find optimal backtest start date — set to 1983-08-31 (when 50% of assets available)
+
+## Strategies
+- [x] Add Max Sharpe (Time-Varying) — re-optimises annually using trailing 5-year rolling window
+- [x] Add Leverage-Optimal (Time-Varying) — re-optimises post-leverage Sharpe annually
+- [x] Remove Carry-Adjusted Risk Parity (redundant)
+- [x] Remove Max Calmar Ratio + DD-constrained variant (redundant)
+- [x] Remove DD Budget (time-varying) (underperforming)

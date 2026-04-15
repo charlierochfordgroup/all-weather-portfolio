@@ -1065,6 +1065,7 @@ with tab_compare:
                 "Max Sharpe (Unconstrained)": "Max Sharpe without a drawdown cap — allows higher concentration in outperforming assets.",
                 "Leverage-Optimal (Unconstrained)": "Leverage-Optimal without a drawdown cap.",
                 f"Max Sharpe (DD \u2264 {dd_constraint_pct}%)": f"Max Sharpe with a hard {dd_constraint_pct}% max drawdown ceiling enforced during optimisation (monthly rebalancing).",
+                f"Max Calmar (DD \u2264 {dd_constraint_pct}%)": f"Max Calmar with a hard {dd_constraint_pct}% max drawdown ceiling enforced during optimisation (monthly rebalancing).",
                 "Regime-Based (time-varying)": "Switches weights based on the current macro regime (high/low inflation × high/low interest rates). A separate portfolio is optimised per regime.",
                 "DD P-Value Momentum (time-varying)": "Annually boosts assets with historically rare drawdowns (buying opportunities) and trims assets near all-time highs. Includes confidence scaling and trend filter.",
                 "Yield Curve Signal (time-varying)": "Tilts defensive when the Fed Funds rate rises >200bp/yr (rate tightening signal). Runs full allocation when rates are stable or falling.",
@@ -2164,8 +2165,8 @@ with tab_guide:
     # ── Drawdown-Constrained ──
     with st.expander("Drawdown-Constrained Strategies"):
         st.markdown(
-            f"**Max Sharpe (DD ≤ X%)** adds a drawdown penalty "
-            f"to the unconstrained Max Sharpe objective. Currently set to **{dd_constraint_pct}%** via the sidebar."
+            f"**Max Sharpe (DD ≤ X%)** and **Max Calmar (DD ≤ X%)** add a drawdown penalty "
+            f"to their unconstrained counterparts. Currently set to **{dd_constraint_pct}%** via the sidebar."
         )
 
     # ── Dynamic Strategies ──
