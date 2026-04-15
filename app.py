@@ -162,7 +162,7 @@ st.sidebar.markdown("**Leverage Settings**")
 cfd_leverage_opt = st.sidebar.number_input(
     "Target Leverage (x)", min_value=1.0, max_value=10.0, value=5.0, step=0.5,
     key="cfd_leverage_opt",
-    help="Target leverage for the Leverage-Optimal and Carry-Adjusted RP strategies. "
+    help="Target leverage for the Leverage-Optimal strategy. "
          "Higher leverage penalises volatility quadratically via vol drag.",
 )
 cfd_financing_opt = st.sidebar.number_input(
@@ -173,15 +173,14 @@ cfd_financing_opt = st.sidebar.number_input(
 
 # Base strategies (always computed once)
 _BASE_TARGETS = [
-    "Max Sharpe Ratio", "Max Calmar Ratio",
+    "Max Sharpe Ratio",
     "Leverage-Optimal",
-    "Carry-Adjusted Risk Parity",
     "Max Sharpe (Unconstrained)",
     "Leverage-Optimal (Unconstrained)",
 ]
 
 # DD-constrained targets (computed for each DD level)
-_DD_TARGETS = ["Max Sharpe (DD \u2264 X%)", "Max Calmar (DD \u2264 X%)"]
+_DD_TARGETS = ["Max Sharpe (DD \u2264 X%)"]
 
 # Slice returns to date range
 start_ts = pd.Timestamp(start_date)
@@ -804,41 +803,63 @@ if _macro_data is not None and "base_results" in st.session_state:
         "strategy_type": "regime",
     }
 
-# --- Drawdown Budget Allocation ---
-from dd_budget import build_dd_budget_schedule, dd_budget_analytics
+# --- Rolling Re-Optimisation (Time-Varying) ---
+if "base_results" in st.session_state:
+    from rolling_optimizer import build_rolling_optimization_schedule
 
-_budget_base_w = st.session_state.base_results.get(
-    "Max Sharpe Ratio", list(st.session_state.base_results.values())[0]
-)["weights"]
-_rebal_for_budget = rebalance if rebalance != "daily" else "monthly"
-_budget_schedule = build_dd_budget_schedule(
-    _budget_base_w, returns, tv_dd_constraint_val,
-    risk_free_rate, _rebal_for_budget, bt_asset_starts,
-)
-_budget_schedule = _enforce_schedule_dd(
-    _budget_schedule, returns, _budget_base_w, tv_dd_constraint_val,
-    risk_free_rate, _rebal_for_budget, bt_asset_starts,
-)
-_budget_stats = calc_stats(
-    returns, _budget_base_w, risk_free_rate,
-    rebalance=_rebal_for_budget, asset_starts=bt_asset_starts,
-    weights_schedule=_budget_schedule,
-)
-_budget_repr_w = _budget_schedule[max(_budget_schedule.keys())] if _budget_schedule else _budget_base_w
-st.session_state.portfolios["DD Budget (time-varying)"] = {
-    "weights": _budget_repr_w,
-    "stats": _budget_stats,
-    "weights_schedule": _budget_schedule,
-    "strategy_type": "dd_budget",
-}
-st.session_state._budget_schedule = _budget_schedule
+    _ms_base_w = st.session_state.base_results.get(
+        "Max Sharpe Ratio", list(st.session_state.base_results.values())[0]
+    )["weights"]
+
+    with st.sidebar:
+        with st.spinner("Computing Max Sharpe (time-varying)..."):
+            _ms_tv_schedule = build_rolling_optimization_schedule(
+                returns, "Max Sharpe Ratio",
+                min_w_default, max_w_default, default_group_max, risk_free_rate,
+                window_years=5, leverage=cfd_leverage_opt, financing_rate=cfd_financing_opt,
+            )
+    if _ms_tv_schedule:
+        _ms_tv_repr_w = _ms_tv_schedule[max(_ms_tv_schedule.keys())]
+        _rebal_for_tv = rebalance if rebalance != "daily" else "annual"
+        _ms_tv_stats = calc_stats(
+            returns, _ms_base_w, risk_free_rate,
+            rebalance=_rebal_for_tv, asset_starts=bt_asset_starts,
+            weights_schedule=_ms_tv_schedule,
+        )
+        st.session_state.portfolios["Max Sharpe (time-varying)"] = {
+            "weights": _ms_tv_repr_w,
+            "stats": _ms_tv_stats,
+            "weights_schedule": _ms_tv_schedule,
+            "strategy_type": "rolling_sharpe",
+        }
+
+    with st.sidebar:
+        with st.spinner("Computing Leverage-Optimal (time-varying)..."):
+            _lo_tv_schedule = build_rolling_optimization_schedule(
+                returns, "Leverage-Optimal",
+                min_w_default, max_w_default, default_group_max, risk_free_rate,
+                window_years=5, leverage=cfd_leverage_opt, financing_rate=cfd_financing_opt,
+            )
+    if _lo_tv_schedule:
+        _lo_tv_repr_w = _lo_tv_schedule[max(_lo_tv_schedule.keys())]
+        _lo_tv_stats = calc_stats(
+            returns, _ms_base_w, risk_free_rate,
+            rebalance=_rebal_for_tv, asset_starts=bt_asset_starts,
+            weights_schedule=_lo_tv_schedule,
+        )
+        st.session_state.portfolios["Leverage-Optimal (time-varying)"] = {
+            "weights": _lo_tv_repr_w,
+            "stats": _lo_tv_stats,
+            "weights_schedule": _lo_tv_schedule,
+            "strategy_type": "rolling_leverage",
+        }
 
 
 # --- Yield Curve Signal Overlay ---
 if _macro_data is not None and "base_results" in st.session_state:
     from yield_signal import build_yield_signal_schedule, yield_signal_analytics
 
-    _yc_base_w = _budget_base_w  # same Max Sharpe base
+    _yc_base_w = _ms_base_w  # Max Sharpe base
     _rebal_for_yc = rebalance if rebalance != "daily" else "monthly"
     _yc_schedule = build_yield_signal_schedule(
         _yc_base_w, _macro_data, returns,
@@ -1040,17 +1061,15 @@ with tab_compare:
         with st.expander("ℹ️ Strategy descriptions"):
             _STRATEGY_DESCRIPTIONS = {
                 "Max Sharpe Ratio": "Maximises return per unit of risk (Sharpe ratio). Constrained by asset/group limits.",
-                "Max Calmar Ratio": "Maximises return relative to worst drawdown (Calmar ratio). Favours low-drawdown equity paths.",
                 "Leverage-Optimal": "Finds the unleveraged allocation that compounds best when leveraged. Penalises vol drag quadratically — tends to favour low-vol assets.",
-                "Carry-Adjusted Risk Parity": "Equal Risk Contribution weighted by net carry (CAGR − financing rate). Reduces exposure to low-carry or negative-carry assets.",
                 "Max Sharpe (Unconstrained)": "Max Sharpe without a drawdown cap — allows higher concentration in outperforming assets.",
                 "Leverage-Optimal (Unconstrained)": "Leverage-Optimal without a drawdown cap.",
                 f"Max Sharpe (DD \u2264 {dd_constraint_pct}%)": f"Max Sharpe with a hard {dd_constraint_pct}% max drawdown ceiling enforced during optimisation (monthly rebalancing).",
-                f"Max Calmar (DD \u2264 {dd_constraint_pct}%)": f"Max Calmar with a hard {dd_constraint_pct}% max drawdown ceiling enforced during optimisation (monthly rebalancing).",
                 "Regime-Based (time-varying)": "Switches weights based on the current macro regime (high/low inflation × high/low interest rates). A separate portfolio is optimised per regime.",
                 "DD P-Value Momentum (time-varying)": "Annually boosts assets with historically rare drawdowns (buying opportunities) and trims assets near all-time highs. Includes confidence scaling and trend filter.",
-                "DD Budget (time-varying)": "Scales total exposure proportional to remaining drawdown headroom. Full allocation at peak equity; progressively dials back toward cash as drawdown deepens.",
                 "Yield Curve Signal (time-varying)": "Tilts defensive when the Fed Funds rate rises >200bp/yr (rate tightening signal). Runs full allocation when rates are stable or falling.",
+                "Max Sharpe (time-varying)": "Re-optimises Max Sharpe annually using a trailing 5-year window. Adapts to changing market conditions without lookahead.",
+                "Leverage-Optimal (time-varying)": "Re-optimises Leverage-Optimal annually using a trailing 5-year window. Adapts post-leverage Sharpe to evolving vol/correlation regimes.",
                 "Dalio All Weather": "Ray Dalio's classic: 30% S&P 500, 40% LT Treasuries, 15% ST Treasuries, 7.5% Gold, 7.5% Commodities. An unoptimised reference benchmark.",
             }
             for sname, sdesc in _STRATEGY_DESCRIPTIONS.items():
@@ -1326,10 +1345,11 @@ with tab_dynamic:
     _dyn_summary = [
         ("Regime-Based (time-varying)", "Regime-Based"),
         ("DD P-Value Momentum (time-varying)", "DD Momentum"),
-        ("DD Budget (time-varying)", "DD Budget"),
         ("Yield Curve Signal (time-varying)", "Yield Curve"),
+        ("Max Sharpe (time-varying)", "Max Sharpe TV"),
+        ("Leverage-Optimal (time-varying)", "Lev-Opt TV"),
     ]
-    _dyn_summary_cols = st.columns(4)
+    _dyn_summary_cols = st.columns(5)
     for _col, (_skey, _slabel) in zip(_dyn_summary_cols, _dyn_summary):
         with _col:
             if _skey in st.session_state.portfolios:
@@ -1615,46 +1635,7 @@ with tab_dynamic:
     else:
         st.info("DD Momentum data not available — ensure base portfolios are computed.")
 
-    # ── Section C: Drawdown Budget Allocation ──
-    st.divider()
-    st.subheader("Drawdown Budget Allocation")
-    st.caption("Dynamically scales exposure based on remaining drawdown headroom. "
-               f"Budget = {tv_dd_constraint_pct}% (from sidebar). At peak = full allocation; as DD deepens, scales toward cash.")
-
-    if "_budget_schedule" in st.session_state and st.session_state._budget_schedule:
-        _ba = dd_budget_analytics(returns, _budget_base_w, tv_dd_constraint_val, st.session_state._budget_schedule)
-        if _ba["dates"]:
-            fig_budget = go.Figure()
-            fig_budget.add_trace(go.Scatter(
-                x=_ba["dates"], y=[sf * 100 for sf in _ba["scale_factors"]],
-                mode="lines", name="Exposure (%)", line=dict(color="#FF6D00", width=2),
-            ))
-            fig_budget.update_layout(
-                yaxis_title="Exposure (%)", xaxis_title="Date",
-                yaxis=dict(range=[0, 105]),
-                template="plotly_white", height=250,
-            )
-            st.plotly_chart(fig_budget, width="stretch")
-
-            # Equity curve comparison
-            if "DD Budget (time-varying)" in st.session_state.portfolios and "Max Sharpe Ratio" in st.session_state.portfolios:
-                st.caption("DD Budget vs Max Sharpe (Static)")
-                eq_budget = compute_equity_curve(returns, _budget_base_w,
-                                                  rebalance=_rebal_for_budget, asset_starts=bt_asset_starts,
-                                                  weights_schedule=st.session_state._budget_schedule)
-                _ms_w_b = st.session_state.portfolios["Max Sharpe Ratio"]["weights"]
-                eq_sharpe_b = compute_equity_curve(returns, _ms_w_b,
-                                                    rebalance=rebalance, asset_starts=bt_asset_starts)
-                fig_bv = go.Figure()
-                fig_bv.add_trace(go.Scatter(x=eq_budget.index, y=eq_budget.values, name="DD Budget (time-varying)", line=dict(color="#FF6D00")))
-                fig_bv.add_trace(go.Scatter(x=eq_sharpe_b.index, y=eq_sharpe_b.values, name="Max Sharpe (Static)", line=dict(color="#2962FF")))
-                fig_bv.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
-                                     template="plotly_white", height=350, hovermode="x unified")
-                st.plotly_chart(fig_bv, width="stretch")
-    else:
-        st.info("DD Budget data not available.")
-
-    # ── Section D: Yield Curve Signal Overlay ──
+    # ── Section C: Yield Curve Signal Overlay ──
     st.divider()
     st.subheader("Yield Curve Signal Overlay")
     st.caption("Tilts defensive when the Fed Funds rate is rising >200 bp/yr. "
@@ -1695,6 +1676,47 @@ with tab_dynamic:
         st.info("Yield Curve Signal requires macro data (Inflation and IR.xlsx).")
     else:
         st.info("Yield Curve Signal data not available.")
+
+    # ── Section D: Rolling Re-Optimisation Strategies ──
+    st.divider()
+    st.subheader("Rolling Re-Optimisation")
+    st.caption("Re-optimises the objective function annually using a trailing 5-year window. "
+               "No lookahead bias — each year's allocation only uses data available at the time.")
+
+    for _tv_key, _tv_label, _static_key, _tv_color in [
+        ("Max Sharpe (time-varying)", "Max Sharpe (Time-Varying)", "Max Sharpe Ratio", "#9C27B0"),
+        ("Leverage-Optimal (time-varying)", "Leverage-Optimal (Time-Varying)", "Leverage-Optimal", "#E91E63"),
+    ]:
+        if _tv_key in st.session_state.portfolios:
+            _tv_data = st.session_state.portfolios[_tv_key]
+            _tv_s = _tv_data["stats"]
+            st.markdown(f"**{_tv_label}** — CAGR {_tv_s.cagr*100:.1f}%, "
+                        f"Sharpe {_tv_s.sharpe:.2f}, Max DD {_tv_s.max_drawdown*100:.0f}%")
+
+            # Equity curve comparison vs static counterpart
+            if _static_key in st.session_state.portfolios:
+                _static_w = st.session_state.portfolios[_static_key]["weights"]
+                _tv_sched = _tv_data.get("weights_schedule", {})
+                if _tv_sched:
+                    _tv_base_w = list(_tv_sched.values())[0]
+                    _rebal_tv = rebalance if rebalance != "daily" else "annual"
+                    eq_tv = compute_equity_curve(returns, _tv_base_w,
+                                                 rebalance=_rebal_tv, asset_starts=bt_asset_starts,
+                                                 weights_schedule=_tv_sched)
+                    eq_static = compute_equity_curve(returns, _static_w,
+                                                      rebalance=rebalance, asset_starts=bt_asset_starts)
+                    fig_tv = go.Figure()
+                    fig_tv.add_trace(go.Scatter(x=eq_tv.index, y=eq_tv.values,
+                                                name=_tv_label, line=dict(color=_tv_color)))
+                    fig_tv.add_trace(go.Scatter(x=eq_static.index, y=eq_static.values,
+                                                name=f"{_static_key} (Static)", line=dict(color="#2962FF")))
+                    fig_tv.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
+                                         template="plotly_white", height=350, hovermode="x unified",
+                                         margin=dict(l=70, r=20, t=30, b=50))
+                    st.plotly_chart(fig_tv, use_container_width=True)
+
+    if "Max Sharpe (time-varying)" not in st.session_state.portfolios:
+        st.info("Rolling re-optimisation not available — ensure base portfolios are computed.")
 
 # ======================================================================
 # TAB 3: CFD ANALYSIS
@@ -2117,7 +2139,6 @@ with tab_guide:
         st.markdown(
             "**Max Sharpe Ratio** maximises return per unit of risk. "
             "**Min Volatility** targets the lowest portfolio standard deviation. "
-            "**Max Calmar Ratio** maximises return relative to worst drawdown. "
             "**Minimize Max Drawdown** directly targets the smallest peak-to-trough loss."
         )
         st.markdown(
@@ -2135,11 +2156,6 @@ with tab_guide:
             "Tends to favour low-vol assets because vol drag scales quadratically with leverage."
         )
         st.markdown(
-            "**Carry-Adjusted Risk Parity** modifies Equal Risk Contribution by accounting "
-            "for CFD financing costs. Each asset's net carry = historical CAGR − financing rate. "
-            "Assets with positive carry receive higher weights; those with negative carry are underweighted."
-        )
-        st.markdown(
             "**Adaptive Lookback Blend** runs Max Sharpe optimisation over four trailing windows "
             "(63, 126, 252, 504 days) and equal-weight blends the results. "
             "Smooths allocations across time horizons, reducing sensitivity to lookback choice."
@@ -2148,8 +2164,8 @@ with tab_guide:
     # ── Drawdown-Constrained ──
     with st.expander("Drawdown-Constrained Strategies"):
         st.markdown(
-            f"**Max Sharpe (DD ≤ X%)** and **Max Calmar (DD ≤ X%)** add a drawdown penalty "
-            f"to their unconstrained counterparts. Currently set to **{dd_constraint_pct}%** via the sidebar."
+            f"**Max Sharpe (DD ≤ X%)** adds a drawdown penalty "
+            f"to the unconstrained Max Sharpe objective. Currently set to **{dd_constraint_pct}%** via the sidebar."
         )
 
     # ── Dynamic Strategies ──
@@ -2165,10 +2181,9 @@ with tab_guide:
             "The bump schedule shape is optimised via grid search to maximise CAGR."
         )
         st.markdown(
-            "**DD Budget Allocation** tracks the portfolio's running drawdown from peak and "
-            "scales exposure proportional to remaining headroom: scale = (budget − |DD|) / budget. "
-            "At peak equity, full allocation. As DD deepens, progressively shifts to cash. "
-            "Creates synthetic downside protection without options."
+            "**Max Sharpe (Time-Varying)** and **Leverage-Optimal (Time-Varying)** re-optimise "
+            "their respective objectives annually using a trailing 5-year window of returns. "
+            "This adapts allocations to changing market conditions without lookahead bias."
         )
         st.markdown(
             "**Ensemble Meta-Strategy** treats static strategies as sub-portfolios and "
@@ -2248,10 +2263,6 @@ Tick "Exclude Bitcoin" in the sidebar to see more typical figures.
 
 ---
 
-**Why does Max Calmar sometimes have a lower Calmar than other strategies?**
-
-Same root cause as the Sharpe anomaly: Max Calmar is optimised to minimise drawdown relative to return on the overlap period (2010+), but statistics are reported on the full backtest (1983+).
-Pre-2010 data may include drawdowns the optimiser never "saw", meaning the actual realised Calmar can fall short of what was targeted.
 """)
 
 # ──────────────────────────────────────────────

@@ -1393,6 +1393,78 @@ class TestScheduleBoundaries:
             assert np.all(sw >= -1e-10), f"Negative ensemble weight at {date}"
 
 
+class TestRollingOptimizer:
+    """Tests for the rolling re-optimization time-varying strategies."""
+
+    def test_rolling_schedule_has_entries(self):
+        """Rolling optimizer should produce at least one schedule entry for 5yr+ data."""
+        from rolling_optimizer import build_rolling_optimization_schedule
+        # 8 years of data → should get entries after the 2-year minimum
+        ret = _make_returns(n_days=2016)  # ~8 years
+        min_w, max_w = _default_bounds()
+        gm = _default_group_max()
+        schedule = build_rolling_optimization_schedule(
+            ret, "Max Sharpe Ratio", min_w, max_w, gm,
+            window_years=5, rebalance="annual",
+        )
+        assert len(schedule) >= 1, "Should have at least one rebalance entry"
+
+    def test_rolling_schedule_no_lookahead(self):
+        """Each schedule entry should only use data up to the rebalance date."""
+        from rolling_optimizer import build_rolling_optimization_schedule
+        ret = _make_returns(n_days=2016)
+        min_w, max_w = _default_bounds()
+        gm = _default_group_max()
+        schedule = build_rolling_optimization_schedule(
+            ret, "Max Sharpe Ratio", min_w, max_w, gm,
+            window_years=5, rebalance="annual",
+        )
+        for date in schedule:
+            assert date <= ret.index[-1], f"Schedule date {date} is after data end"
+
+    def test_rolling_weights_valid(self):
+        """All schedule weights should sum to ~1 and be non-negative."""
+        from rolling_optimizer import build_rolling_optimization_schedule
+        ret = _make_returns(n_days=2016)
+        min_w, max_w = _default_bounds()
+        gm = _default_group_max()
+        schedule = build_rolling_optimization_schedule(
+            ret, "Max Sharpe Ratio", min_w, max_w, gm,
+            window_years=5, rebalance="annual",
+        )
+        for date, w in schedule.items():
+            assert abs(w.sum() - 1.0) < 1e-4, f"Weights don't sum to 1 at {date}: {w.sum()}"
+            assert np.all(w >= -1e-8), f"Negative weight at {date}"
+            assert len(w) == len(ASSETS)
+
+    def test_rolling_leverage_optimal(self):
+        """Leverage-Optimal rolling should also produce valid weights."""
+        from rolling_optimizer import build_rolling_optimization_schedule
+        ret = _make_returns(n_days=2016)
+        min_w, max_w = _default_bounds()
+        gm = _default_group_max()
+        schedule = build_rolling_optimization_schedule(
+            ret, "Leverage-Optimal", min_w, max_w, gm,
+            window_years=5, rebalance="annual",
+            leverage=5.0, financing_rate=0.065,
+        )
+        assert len(schedule) >= 1
+        for date, w in schedule.items():
+            assert abs(w.sum() - 1.0) < 1e-4
+
+    def test_rolling_insufficient_data(self):
+        """With less than 2 years of data, schedule should be empty."""
+        from rolling_optimizer import build_rolling_optimization_schedule
+        ret = _make_returns(n_days=400)  # ~1.6 years
+        min_w, max_w = _default_bounds()
+        gm = _default_group_max()
+        schedule = build_rolling_optimization_schedule(
+            ret, "Max Sharpe Ratio", min_w, max_w, gm,
+            window_years=5, rebalance="annual",
+        )
+        assert len(schedule) == 0, "Should be empty with insufficient data"
+
+
 class TestPeriodicRebalanceBoundaries:
     """Verify that periodic rebalancing correctly resets at boundaries."""
 
