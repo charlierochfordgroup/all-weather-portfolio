@@ -90,7 +90,6 @@ data_end = returns_full.index[-1].date()
 st.sidebar.header("Analysis Settings")
 
 # Default start: date when 50% of assets have data (1983-08-31)
-import datetime as _dt
 _start_default_50pct = pd.Timestamp("1983-08-31").date()
 _start_default = _start_default_50pct
 if st.session_state.get("_use_inception", False):
