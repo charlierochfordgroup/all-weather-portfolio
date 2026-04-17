@@ -9,7 +9,6 @@ passed directly to `calc_stats(..., weights_schedule=schedule)`.
 import numpy as np
 import pandas as pd
 
-from data import ASSETS
 from stats import _make_period_labels
 from optimizer import run_optimization
 
