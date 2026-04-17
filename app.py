@@ -2136,28 +2136,20 @@ with tab_guide:
     # ── Optimisation Strategies ──
     with st.expander("Optimisation Strategies", expanded=True):
         st.markdown(
-            "**Max Sharpe Ratio** maximises return per unit of risk. "
-            "**Min Volatility** targets the lowest portfolio standard deviation. "
-            "**Minimize Max Drawdown** directly targets the smallest peak-to-trough loss."
-        )
-        st.markdown(
-            "**Inverse Volatility** weights assets inversely to their vol — simple and transparent. "
-            "**Equal Risk Contribution** equalises each asset's risk contribution, accounting for correlations. "
-            "**Hierarchical Risk Parity** clusters correlated assets and allocates top-down for robustness."
+            "**Max Sharpe Ratio** maximises return per unit of risk using the overlap "
+            "period (when all 26 assets have data). "
+            "**Max Sharpe (Unconstrained)** runs the same optimisation without the group "
+            "caps or per-asset maxima for a \"pure optimal\" reference."
         )
 
     # ── Leverage-Aware Strategies ──
     with st.expander("Leverage-Aware Strategies"):
         st.markdown(
             "**Leverage-Optimal** maximises post-leverage, post-financing Sharpe ratio directly. "
-            "The objective accounts for volatility drag (L(L−1)σ²/2) and financing costs, "
-            "finding the unleveraged allocation that compounds best when leveraged. "
-            "Tends to favour low-vol assets because vol drag scales quadratically with leverage."
-        )
-        st.markdown(
-            "**Adaptive Lookback Blend** runs Max Sharpe optimisation over four trailing windows "
-            "(63, 126, 252, 504 days) and equal-weight blends the results. "
-            "Smooths allocations across time horizons, reducing sensitivity to lookback choice."
+            "The objective accounts for volatility drag (L(L−1)σ²/2) and CMC-style "
+            "full-notional financing cost (rate × L). Tends to favour low-vol assets "
+            "because vol drag scales quadratically with leverage. "
+            "**Leverage-Optimal (Unconstrained)** drops the group caps for comparison."
         )
 
     # ── Drawdown-Constrained ──
