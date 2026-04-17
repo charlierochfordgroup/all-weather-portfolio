@@ -144,11 +144,10 @@ if rebalance != "monthly":
         f"⚠️ DD constraints optimised for monthly rebalancing. "
         f"At {rebalance_freq} rebalancing, actual drawdowns may differ slightly."
     )
-_TV_DD_LEVELS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
 tv_dd_constraint_pct = st.sidebar.selectbox(
     "Max DD \u2013 Time-Varying (%)",
-    _TV_DD_LEVELS,
-    index=_TV_DD_LEVELS.index(50),
+    _DD_LEVELS,
+    index=_DD_LEVELS.index(50),
     key="tv_dd_constraint_select",
     help="Separate drawdown cap for Regime-Based and DD P-Value Momentum strategies. "
          "Enforced as a hard constraint on the full backtest equity curve.",
