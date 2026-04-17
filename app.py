@@ -1713,7 +1713,7 @@ with tab_dynamic:
                     fig_tv.update_layout(yaxis_type="log", yaxis_title="Growth of $1 (Log)", xaxis_title="Date",
                                          template="plotly_white", height=350, hovermode="x unified",
                                          margin=dict(l=70, r=20, t=30, b=50))
-                    st.plotly_chart(fig_tv, use_container_width=True)
+                    st.plotly_chart(fig_tv, width="stretch")
 
     if "Max Sharpe (time-varying)" not in st.session_state.portfolios:
         st.info("Rolling re-optimisation not available — ensure base portfolios are computed.")
